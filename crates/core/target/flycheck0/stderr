@@ -1,0 +1,11 @@
+error: failed searching for potential workspace
+package manifest: `/Users/sawanbhattacharya/Desktop/codemaster/zdiff/crates/core/Cargo.toml`
+invalid potential workspace manifest: `/Users/sawanbhattacharya/Desktop/codemaster/zdiff/Cargo.toml`
+
+help: to avoid searching for a non-existent workspace, add `[workspace]` to the package manifest
+
+Caused by:
+  failed to parse manifest at `/Users/sawanbhattacharya/Desktop/codemaster/zdiff/Cargo.toml`
+
+Caused by:
+  manifest is missing either a `[package]` or a `[workspace]`
