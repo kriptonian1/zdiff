@@ -6,8 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-memchr = "2.8.3"
+gix = { workspace = true, features = ["basic", "status", "sha1", "parallel", "max-performance-safe"] }
+memchr.workspace = true
 thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

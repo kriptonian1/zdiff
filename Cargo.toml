@@ -11,6 +11,11 @@ license = "MIT"
 
 [workspace.dependencies]
 zdiff-core = { path = "crates/core" }
+gix = { version = "0.88.0", default-features = false }
+tempfile = "3"
+memchr = "2.8.3"
+notify = "8.2"
+unicode-width = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
