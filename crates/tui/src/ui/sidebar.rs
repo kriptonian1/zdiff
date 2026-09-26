@@ -59,7 +59,7 @@ fn file_row(file: &FileEntry, selected: bool, width: u16) -> Line<'_> {
 
 fn status_color(status: Status) -> Color {
     match status {
-        Status::Added => GREEN,
+        Status::Added | Status::Untracked => GREEN,
         Status::Modified => YELLOW,
         Status::Deleted => RED,
     }
@@ -72,19 +72,29 @@ mod tests {
 
     #[test]
     fn sidebar_shows_header_status_and_counts() {
-        let mut app = App::new(vec![FileEntry {
-            path: "src/repo.rs".into(),
-            status: Status::Modified,
-            added: 31,
-            removed: 7,
-            change: 0,
-        }]);
-        let sidebar: Vec<String> = render(&mut app, 80, 4)
+        let mut app = App::new(vec![
+            FileEntry {
+                path: "src/repo.rs".into(),
+                status: Status::Modified,
+                added: 31,
+                removed: 7,
+                change: 0,
+            },
+            FileEntry {
+                path: "src/new.rs".into(),
+                status: Status::Untracked,
+                added: 2,
+                removed: 0,
+                change: 1,
+            },
+        ]);
+        let sidebar: Vec<String> = render(&mut app, 80, 5)
             .iter()
             .map(|row| row.chars().take(usize::from(SIDEBAR_MIN)).collect())
             .collect();
         assert_eq!(sidebar[0].trim_end(), "  src");
-        assert!(sidebar[1].starts_with("▌ M repo.rs"), "{sidebar:?}");
-        assert!(sidebar[1].trim_end().ends_with("+31 -7"), "{sidebar:?}");
+        assert!(sidebar[1].starts_with("▌ ? new.rs"), "{sidebar:?}");
+        assert!(sidebar[2].starts_with("  M repo.rs"), "{sidebar:?}");
+        assert!(sidebar[2].trim_end().ends_with("+31 -7"), "{sidebar:?}");
     }
 }

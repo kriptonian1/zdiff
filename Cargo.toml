@@ -11,6 +11,7 @@ license = "MIT"
 
 [workspace.dependencies]
 zdiff-core = { path = "crates/core" }
+zdiff-highlight = { path = "crates/highlight" }
 gix = { version = "0.88.0", default-features = false }
 tempfile = "3"
 memchr = "2.8.3"

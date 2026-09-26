@@ -4,13 +4,14 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
 };
 use zdiff_core::{Kind, Row, Text};
+use zdiff_highlight::Token;
 
-use super::{ADDED_BG, DIM, FILLER_BG, FOLD_BG, GREEN, RED, REMOVED_BG, counts};
+use super::{ADDED_BG, DIM, FILLER_BG, FOLD_BG, GREEN, RED, REMOVED_BG, class_color, counts};
 use crate::app::{App, DiffPane, DiffView, FileEntry};
 use crate::text;
 
@@ -111,26 +112,12 @@ fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
                 Line::from(text).fg(DIM).bg(FOLD_BG).render(at(body), buf);
             }
             Row::Line { old, new, kind } => {
-                cell(
-                    &view.file.old,
-                    *old,
-                    *kind,
-                    &OLD,
-                    view.gutter,
-                    view.hscroll,
-                    text_width(left),
-                )
-                .render(at(left), buf);
-                cell(
-                    &view.file.new,
-                    *new,
-                    *kind,
-                    &NEW,
-                    view.gutter,
-                    view.hscroll,
-                    text_width(right),
-                )
-                .render(at(right), buf);
+                let columns = |pane| view.hscroll..view.hscroll + text_width(pane);
+                let old_side = (&view.file.old, &*view.old_tokens);
+                cell(old_side, *old, *kind, &OLD, view.gutter, columns(left)).render(at(left), buf);
+                let new_side = (&view.file.new, &*view.new_tokens);
+                cell(new_side, *new, *kind, &NEW, view.gutter, columns(right))
+                    .render(at(right), buf);
             }
         }
     }
@@ -146,15 +133,14 @@ fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
 }
 
 /// `12 - text` for one side of a line; a missing side is filler.
-fn cell<'a>(
-    text: &'a Text,
+fn cell(
+    (text, tokens): (&Text, &[Token]),
     line: Option<u32>,
     kind: Kind,
     side: &Side,
     gutter: usize,
-    skip: usize,
-    take: usize,
-) -> Line<'a> {
+    columns: Range<usize>,
+) -> Line<'static> {
     let Some(i) = line else {
         return Line::default().bg(FILLER_BG);
     };
@@ -162,13 +148,23 @@ fn cell<'a>(
         Kind::Context => (" ", DIM, Color::Reset),
         Kind::Change => (side.marker, side.fg, side.bg),
     };
-    Line::from(vec![
+    let mut spans = vec![
         format!("{:>gutter$} ", i + 1).fg(fg),
         marker.fg(fg),
         " ".into(),
-        Span::raw(text::visible(text.line(i), skip, take)),
-    ])
-    .bg(bg)
+    ];
+    let segments = text::segments(
+        text.line(i),
+        text.line_start(i),
+        tokens,
+        columns.start,
+        columns.len(),
+    );
+    spans.extend(segments.into_iter().map(|(content, class)| match class {
+        Some(class) => content.fg(class_color(class)),
+        None => content.into(),
+    }));
+    Line::from(spans).bg(bg)
 }
 
 /// First line number as `git diff` prints it: 1-based, or the insertion point when empty.
@@ -220,6 +216,36 @@ mod tests {
             l.trim().is_empty() && r.starts_with(" 9 + extra"),
             "{screen:#?}"
         );
+    }
+
+    #[test]
+    fn changed_rust_line_is_syntax_colored_on_the_diff_background() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new(vec![FileEntry {
+            path: "a.rs".into(),
+            status: Status::Modified,
+            added: 1,
+            removed: 1,
+            change: 0,
+        }]);
+        app.show(Some(Ok(FileDiff::new(
+            b"fn a() {}\n".to_vec(),
+            b"fn b() {}\n".to_vec(),
+        ))));
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("test backend");
+        terminal
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        // Sidebar is 30 wide; old cell = "1 - fn a() {}", so `fn` starts 4 columns in.
+        let fn_cell = &buffer[(34, 2)];
+        assert_eq!(fn_cell.symbol(), "f");
+        assert_eq!(
+            fn_cell.fg,
+            crate::ui::class_color(zdiff_highlight::Class::Keyword)
+        );
+        assert_eq!(fn_cell.bg, REMOVED_BG);
     }
 
     #[test]

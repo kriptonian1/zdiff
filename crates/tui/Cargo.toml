@@ -13,6 +13,7 @@ notify.workspace = true
 ratatui = "0.30.2"
 unicode-width.workspace = true
 zdiff-core.workspace = true
+zdiff-highlight.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

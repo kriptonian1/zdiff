@@ -53,7 +53,7 @@ fn list(repo: &Repo, spec: &Spec) -> Vec<(String, Status)> {
 }
 
 #[test]
-fn unborn_head_lists_untracked_as_added() {
+fn unborn_head_lists_untracked_files() {
     let dir = init();
     fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
     fs::write(dir.path().join(".gitignore"), "ignored\n").unwrap();
@@ -64,13 +64,34 @@ fn unborn_head_lists_untracked_as_added() {
     assert_eq!(
         summary(&changes),
         [
-            (".gitignore".into(), Status::Added),
-            ("a.txt".into(), Status::Added)
+            (".gitignore".into(), Status::Untracked),
+            ("a.txt".into(), Status::Untracked)
         ]
     );
     let diff = repo.diff(&changes[1]).unwrap();
     assert_eq!(diff.new.bytes(), b"hi\n");
     assert_eq!(diff.hunks.len(), 1);
+}
+
+#[test]
+fn staging_an_untracked_file_makes_it_added() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    commit(dir.path());
+    fs::write(dir.path().join("new.rs"), "n\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    let untracked = [("new.rs".to_owned(), Status::Untracked)];
+    assert_eq!(list(&repo, &Spec::default()), untracked);
+    assert_eq!(list(&repo, &Spec::Unstaged), untracked);
+
+    git(dir.path(), &["add", "new.rs"]);
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert_eq!(
+        list(&repo, &Spec::default()),
+        [("new.rs".to_owned(), Status::Added)]
+    );
+    assert_eq!(list(&repo, &Spec::Unstaged), []);
 }
 
 #[test]

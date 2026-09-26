@@ -37,6 +37,8 @@ pub enum Status {
     Added,
     Modified,
     Deleted,
+    /// On disk but not in the index, like `??` in `git status`.
+    Untracked,
 }
 
 impl Status {
@@ -47,6 +49,7 @@ impl Status {
             Self::Added => "A",
             Self::Modified => "M",
             Self::Deleted => "D",
+            Self::Untracked => "?",
         }
     }
 }
@@ -64,12 +67,16 @@ pub struct Change {
     pub path: PathBuf,
     old: Source,
     new: Source,
+    untracked: bool,
 }
 
 impl Change {
-    /// Whether the file was added, modified, or deleted.
+    /// Whether the file was added, modified, deleted, or is untracked.
     #[must_use]
     pub fn status(&self) -> Status {
+        if self.untracked {
+            return Status::Untracked;
+        }
         match (self.old, self.new) {
             (Source::Missing, _) => Status::Added,
             (_, Source::Missing) => Status::Deleted,
@@ -146,10 +153,10 @@ impl Repo {
         };
         // Parallel status is unordered; both streams may report one path.
         paths.sort_unstable();
-        paths.dedup();
+        paths.dedup_by(|a, b| a.0 == b.0);
 
         let mut changes = Vec::with_capacity(paths.len());
-        for path in paths {
+        for (path, untracked) in paths {
             let old = self.source(&old, path.as_bstr())?;
             let new = self.source(&new, path.as_bstr())?;
             // Same blob (staged then reverted) or absent on both sides.
@@ -159,6 +166,7 @@ impl Repo {
                     path: gix::path::from_bstring(path),
                     old,
                     new,
+                    untracked,
                 });
             }
         }
@@ -183,7 +191,11 @@ impl Repo {
         Ok(self.inner.rev_parse_single(rev)?.object()?.peel_to_tree()?)
     }
 
-    fn status_paths(&self, head: Option<ObjectId>, worktree: bool) -> Result<Vec<BString>, Error> {
+    fn status_paths(
+        &self,
+        head: Option<ObjectId>,
+        worktree: bool,
+    ) -> Result<Vec<(BString, bool)>, Error> {
         // ponytail: renames show as delete + add; add Status::Renamed when needed.
         let status = self
             .inner
@@ -206,7 +218,9 @@ impl Repo {
         // ponytail: Staged still scans index-vs-worktree; gix has no switch.
         for item in status.head_tree(head).into_iter(Vec::new())? {
             match item? {
-                gix::status::Item::TreeIndex(change) => paths.push(change.location().to_owned()),
+                gix::status::Item::TreeIndex(change) => {
+                    paths.push((change.location().to_owned(), false));
+                }
                 gix::status::Item::IndexWorktree(item) if worktree => {
                     paths.extend(worktree_path(&item));
                 }
@@ -264,7 +278,7 @@ fn read_worktree(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<BString>, Error> {
+fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<(BString, bool)>, Error> {
     let mut paths = Vec::new();
     old.changes()?
         .options(|o| {
@@ -272,20 +286,23 @@ fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<BString>, 
         })
         .for_each_to_obtain_tree(new, |change| {
             if !change.entry_mode().is_tree() {
-                paths.push(change.location().to_owned());
+                paths.push((change.location().to_owned(), false));
             }
             Ok(gix::object::tree::diff::Action::Continue(()))
         })?;
     Ok(paths)
 }
 
-fn worktree_path(item: &index_worktree::Item) -> Option<BString> {
-    match item {
-        index_worktree::Item::DirectoryContents { entry, .. }
-            if entry.status != gix::dir::entry::Status::Untracked =>
-        {
-            None
+/// The item's path and whether it is untracked; `None` for ignored or pruned entries.
+fn worktree_path(item: &index_worktree::Item) -> Option<(BString, bool)> {
+    let untracked = match item {
+        index_worktree::Item::DirectoryContents { entry, .. } => {
+            if entry.status != gix::dir::entry::Status::Untracked {
+                return None;
+            }
+            true
         }
-        _ => Some(item.rela_path().to_owned()),
-    }
+        _ => false,
+    };
+    Some((item.rela_path().to_owned(), untracked))
 }

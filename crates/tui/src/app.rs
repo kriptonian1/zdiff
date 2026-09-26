@@ -6,6 +6,7 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 use zdiff_core::{Error, FileDiff, Row, Status, Text};
+use zdiff_highlight::{Language, Token};
 
 use crate::text;
 
@@ -52,6 +53,8 @@ pub struct DiffView {
     pub gutter: usize,
     /// Columns of line text the narrower pane shows; set on every draw.
     pub text_width: usize,
+    pub old_tokens: Box<[Token]>,
+    pub new_tokens: Box<[Token]>,
 }
 
 #[derive(Debug)]
@@ -141,7 +144,12 @@ impl App {
     pub fn show(&mut self, diff: Option<Result<FileDiff, Error>>) {
         self.diff = match diff {
             None => DiffPane::Empty,
-            Some(Ok(file)) => DiffPane::Loaded(DiffView::new(file)),
+            Some(Ok(file)) => {
+                let language = self
+                    .selected_file()
+                    .and_then(|f| zdiff_highlight::language(&f.path));
+                DiffPane::Loaded(DiffView::new(file, language))
+            }
             Some(Err(e)) => DiffPane::Failed(e.to_string().into()),
         };
     }
@@ -301,10 +309,18 @@ impl App {
 }
 
 impl DiffView {
-    fn new(file: FileDiff) -> Self {
+    fn new(file: FileDiff, language: Option<Language>) -> Self {
         let rows = file.rows(CONTEXT_LINES);
         let gutter = file.old.len().max(file.new.len()).to_string().len();
+        // ponytail: highlights with the diff load on the UI thread; move both to a worker if big files stall input.
+        let tokens = |text: &Text| {
+            language.map_or_else(Box::default, |l| {
+                zdiff_highlight::highlight(l, text.bytes())
+            })
+        };
         Self {
+            old_tokens: tokens(&file.old),
+            new_tokens: tokens(&file.new),
             file,
             rows,
             scroll: 0,

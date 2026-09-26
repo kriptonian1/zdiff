@@ -81,6 +81,15 @@ impl Text {
         self.starts.is_empty()
     }
 
+    /// Byte offset where line `i` (zero-based) starts.
+    ///
+    /// # Panics
+    /// Panics if `i >= self.len()`.
+    #[must_use]
+    pub fn line_start(&self, i: u32) -> u32 {
+        self.starts[i as usize]
+    }
+
     /// Line `i` (zero-based) without its `\n` or `\r\n` ending.
     ///
     /// # Panics

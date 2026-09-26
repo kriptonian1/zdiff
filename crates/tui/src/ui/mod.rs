@@ -5,6 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Span;
+use zdiff_highlight::Class;
 
 use crate::app::App;
 
@@ -12,8 +13,9 @@ const SIDEBAR_BG: Color = Color::Rgb(22, 24, 29);
 const SELECTED_BG: Color = Color::Rgb(42, 46, 56);
 const FOLD_BG: Color = Color::Rgb(32, 35, 42);
 const FILLER_BG: Color = Color::Rgb(16, 17, 20);
-const REMOVED_BG: Color = Color::Rgb(60, 25, 28);
-const ADDED_BG: Color = Color::Rgb(25, 50, 32);
+/// GitHub's dark diff line colors (`rgba(248,81,73,.15)` / `rgba(46,160,67,.15)`), blended over `#0d1117`.
+const REMOVED_BG: Color = Color::Rgb(0x30, 0x1b, 0x1e);
+const ADDED_BG: Color = Color::Rgb(0x12, 0x26, 0x1e);
 const DIM: Color = Color::Rgb(140, 146, 158);
 const ACCENT: Color = Color::Rgb(229, 192, 123);
 const GREEN: Color = Color::Rgb(152, 195, 121);
@@ -30,6 +32,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(frame.area());
     sidebar::draw(frame, app, sidebar);
     diff::draw(frame, app, diff);
+}
+
+/// GitHub's dark syntax palette (Primer `prettylights.syntax.*`).
+fn class_color(class: Class) -> Color {
+    match class {
+        Class::Keyword => Color::Rgb(0xff, 0x7b, 0x72),
+        Class::String => Color::Rgb(0xa5, 0xd6, 0xff),
+        Class::Constant => Color::Rgb(0x79, 0xc0, 0xff),
+        Class::Entity => Color::Rgb(0xd2, 0xa8, 0xff),
+        Class::Tag => Color::Rgb(0x7e, 0xe7, 0x87),
+        Class::Comment => Color::Rgb(0x91, 0x98, 0xa1),
+    }
 }
 
 /// `+N -M` in green and red; zero counts are left out.
