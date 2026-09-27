@@ -180,6 +180,39 @@ fn open_repo_sees_later_index_changes() {
 }
 
 #[test]
+fn head_name_is_the_branch_or_the_short_id_when_detached() {
+    let dir = init();
+    let repo = Repo::discover(dir.path()).unwrap();
+    let branch = git(dir.path(), &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(repo.head_name(), branch, "unborn branch");
+    fs::write(dir.path().join("a"), "a\n").unwrap();
+    let id = commit(dir.path());
+    git(dir.path(), &["checkout", "-q", "--detach"]);
+    assert_eq!(repo.head_name(), id[..7]);
+}
+
+#[test]
+fn spec_reads_as_old_then_new() {
+    let cases = [
+        (Spec::default(), "HEAD → worktree"),
+        (Spec::Staged("HEAD".into()), "HEAD → index"),
+        (Spec::Unstaged, "index → worktree"),
+        (Spec::Revs("main".into(), "dev".into()), "main → dev"),
+    ];
+    for (spec, text) in cases {
+        assert_eq!(spec.to_string(), text);
+    }
+}
+
+#[test]
+fn workdir_is_absolute_when_discovered_from_a_relative_path() {
+    // Tests run in the crate dir, two levels below the repo root.
+    let repo = Repo::discover(".").unwrap();
+    assert!(repo.workdir().is_absolute(), "{:?}", repo.workdir());
+    assert!(repo.workdir().file_name().is_some(), "names the folder");
+}
+
+#[test]
 fn non_repo_is_a_discover_error() {
     let dir = tempfile::tempdir().unwrap();
     assert!(matches!(

@@ -10,11 +10,30 @@ use zdiff_highlight::{Class, Token};
 /// Columns a tab expands to; a raw tab would break column alignment.
 const TAB_WIDTH: usize = 4;
 
-/// How a run of text is drawn: its syntax class and whether it is a changed word.
+/// How a run of text is drawn: syntax class, changed-word emphasis, and search match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Look {
     pub class: Option<Class>,
     pub emph: bool,
+    pub found: Found,
+}
+
+/// Whether text is a search match, and whether it is the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Found {
+    #[default]
+    No,
+    Match,
+    Current,
+}
+
+/// Sorted file byte ranges that style a line; see [`segments`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Marks<'a> {
+    pub tokens: &'a [Token],
+    pub emph: &'a [Range<u32>],
+    pub found: &'a [Range<u32>],
+    pub current: Option<&'a Range<u32>>,
 }
 
 /// A run of visible text that shares one [`Look`].
@@ -24,27 +43,27 @@ pub type Segment = (String, Look);
 ///
 /// Control characters become `�`, so file content cannot inject escape sequences.
 pub fn visible(bytes: &[u8], skip: usize, take: usize) -> String {
-    segments(bytes, 0, &[], &[], skip, take)
+    segments(bytes, 0, Marks::default(), skip, take)
         .into_iter()
         .map(|(text, _)| text)
         .collect()
 }
 
-/// Like [`visible`], split wherever the syntax class or word emphasis changes.
+/// Like [`visible`], split wherever the [`Look`] from `marks` changes.
 ///
-/// `line_start` is the line's byte offset in the file that `tokens` and `emph` index into.
+/// `line_start` is the line's byte offset in the file that `marks` index into.
 pub fn segments(
     bytes: &[u8],
     line_start: u32,
-    tokens: &[Token],
-    emph: &[Range<u32>],
+    marks: Marks<'_>,
     skip: usize,
     take: usize,
 ) -> Vec<Segment> {
     let token_span = |t: &Token| (t.start, t.end);
-    let emph_span = |r: &Range<u32>| (r.start, r.end);
-    let mut tokens = from(tokens, line_start, token_span);
-    let mut emph = from(emph, line_start, emph_span);
+    let range_span = |r: &Range<u32>| (r.start, r.end);
+    let mut tokens = from(marks.tokens, line_start, token_span);
+    let mut emph = from(marks.emph, line_start, range_span);
+    let mut found = from(marks.found, line_start, range_span);
     let mut out: Vec<Segment> = Vec::new();
     let mut column = 0;
     for (offset, c, width) in glyphs(bytes) {
@@ -56,7 +75,17 @@ pub fn segments(
             let at = line_start as usize + offset;
             let look = Look {
                 class: covering(&mut tokens, at, token_span).map(|t| t.class),
-                emph: covering(&mut emph, at, emph_span).is_some(),
+                emph: covering(&mut emph, at, range_span).is_some(),
+                found: if marks
+                    .current
+                    .is_some_and(|r| (r.start as usize..r.end as usize).contains(&at))
+                {
+                    Found::Current
+                } else if covering(&mut found, at, range_span).is_some() {
+                    Found::Match
+                } else {
+                    Found::No
+                },
             };
             if out.last().is_none_or(|(_, last)| *last != look) {
                 out.push((String::new(), look));
@@ -161,7 +190,19 @@ mod tests {
     }
 
     fn look(class: Option<Class>, emph: bool) -> Look {
-        Look { class, emph }
+        Look {
+            class,
+            emph,
+            found: Found::No,
+        }
+    }
+
+    fn marks<'a>(tokens: &'a [Token], emph: &'a [Range<u32>]) -> Marks<'a> {
+        Marks {
+            tokens,
+            emph,
+            ..Marks::default()
+        }
     }
 
     #[test]
@@ -169,7 +210,7 @@ mod tests {
         // File "xx" + line "fn main", tokens in file offsets.
         let tokens = [token(2, 4, Class::Keyword), token(5, 9, Class::Entity)];
         assert_eq!(
-            segments(b"fn main", 2, &tokens, &[], 0, 80),
+            segments(b"fn main", 2, marks(&tokens, &[]), 0, 80),
             [
                 ("fn".into(), look(Some(Class::Keyword), false)),
                 (" ".into(), Look::default()),
@@ -183,7 +224,7 @@ mod tests {
     fn segments_split_where_emphasis_changes_independent_of_class() {
         let tokens = [token(0, 6, Class::String)];
         assert_eq!(
-            segments(b"\"abcd\" x", 0, &tokens, &[3..7], 0, 80),
+            segments(b"\"abcd\" x", 0, marks(&tokens, &[3..7]), 0, 80),
             [
                 ("\"ab".into(), look(Some(Class::String), false)),
                 ("cd\"".into(), look(Some(Class::String), true)),
@@ -197,12 +238,12 @@ mod tests {
     fn segments_keep_the_class_when_skipping_into_a_token() {
         let tokens = [token(0, 6, Class::String)];
         assert_eq!(
-            segments(b"\"abcd\" x", 0, &tokens, &[], 2, 3),
+            segments(b"\"abcd\" x", 0, marks(&tokens, &[]), 2, 3),
             [("bcd".into(), look(Some(Class::String), false))]
         );
         let tabbed = [token(1, 2, Class::Keyword)];
         assert_eq!(
-            segments(b"\tk", 0, &tabbed, &[], 2, 10),
+            segments(b"\tk", 0, marks(&tabbed, &[]), 2, 10),
             [
                 ("  ".into(), Look::default()),
                 ("k".into(), look(Some(Class::Keyword), false))
@@ -213,5 +254,29 @@ mod tests {
     #[test]
     fn visible_blocks_escape_sequences() {
         assert_eq!(visible(b"\x1b[31mred", 0, 80), "\u{FFFD}[31mred");
+    }
+
+    #[test]
+    fn segments_mark_search_matches_and_the_current_one() {
+        let current = 6..7;
+        let found = [1..2, 6..7];
+        let marks = Marks {
+            found: &found,
+            current: Some(&current),
+            ..Marks::default()
+        };
+        let found_as = |found| Look {
+            found,
+            ..Look::default()
+        };
+        assert_eq!(
+            segments(b"axxxxxa", 0, marks, 0, 80),
+            [
+                ("a".into(), Look::default()),
+                ("x".into(), found_as(Found::Match)),
+                ("xxxx".into(), Look::default()),
+                ("a".into(), found_as(Found::Current)),
+            ]
+        );
     }
 }

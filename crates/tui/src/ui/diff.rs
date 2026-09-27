@@ -8,15 +8,15 @@ use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
 };
-use zdiff_core::{Kind, Row, Status, Text};
-use zdiff_highlight::Token;
+use zdiff_core::{Kind, Row, Side as FileSide, Status, Text};
 
 use super::{
-    ADDED_BG, ADDED_EMPH_BG, DIM, FILLER_BG, FOLD_BG, GREEN, RED, REMOVED_BG, REMOVED_EMPH_BG,
-    STRIPE_FG, STRIPE_GAP, class_color, counts,
+    ACCENT, ADDED_BG, ADDED_EMPH_BG, DIM, FILLER_BG, FOLD_BG, GREEN, RED, REMOVED_BG,
+    REMOVED_EMPH_BG, STRIPE_FG, STRIPE_GAP, counts, styled,
 };
 use crate::app::{App, DiffPane, DiffView, FileEntry};
-use crate::text;
+use crate::find::Find;
+use crate::text::{self, Marks};
 
 /// Columns before the line text in a cell: space, marker, space.
 const MARKER_WIDTH: usize = 3;
@@ -59,7 +59,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             message(frame.buffer_mut(), body, text);
         }
-        DiffPane::Loaded(view) => draw_rows(frame, view, body),
+        DiffPane::Loaded(view) => draw_rows(frame, view, app.find.as_ref(), body),
     }
 }
 
@@ -79,7 +79,7 @@ fn message(buf: &mut Buffer, area: Rect, text: &str) {
 }
 
 /// Renders only the rows that fit on screen, so cost follows screen height, not file size.
-fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
+fn draw_rows(frame: &mut Frame, view: &mut DiffView, find: Option<&Find>, body: Rect) {
     let height = usize::from(body.height);
     view.scroll = view.scroll.min(view.max_scroll(height));
     let [left, divider, right] = Layout::horizontal([
@@ -92,12 +92,22 @@ fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
         |pane: Rect| usize::from(pane.width).saturating_sub(view.gutter + MARKER_WIDTH);
     view.text_width = text_width(left).min(text_width(right));
 
+    let view = &*view;
+    let current = find.and_then(|f| f.current_range(view));
+    let marks = |side: FileSide| Marks {
+        tokens: side.pick(&view.old_tokens, &view.new_tokens),
+        emph: side.pick(&view.words.old, &view.words.new),
+        found: find.map_or(&[], |f| side.pick(&f.found[0], &f.found[1])),
+        current: current.as_ref().filter(|(s, _)| *s == side).map(|(_, r)| r),
+    };
     let buf = frame.buffer_mut();
     Block::new()
         .borders(Borders::LEFT)
         .fg(DIM)
         .render(divider, buf);
-    for (y, row) in (body.y..body.bottom()).zip(&view.rows[view.scroll..]) {
+    let rows = view.rows[view.scroll..].iter().enumerate();
+    for (y, (k, row)) in (body.y..body.bottom()).zip(rows) {
+        let jumped = view.mark == Some(view.scroll + k);
         let at = |area: Rect| Rect {
             y,
             height: 1,
@@ -124,21 +134,12 @@ fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
             Row::Line { old, new, kind } => {
                 let columns = |pane| view.hscroll..view.hscroll + text_width(pane);
                 let sides = [
-                    (
-                        left,
-                        &OLD,
-                        (&view.file.old, &*view.old_tokens, &*view.words.old),
-                        *old,
-                    ),
-                    (
-                        right,
-                        &NEW,
-                        (&view.file.new, &*view.new_tokens, &*view.words.new),
-                        *new,
-                    ),
+                    (left, &OLD, (&view.file.old, marks(FileSide::Old)), *old),
+                    (right, &NEW, (&view.file.new, marks(FileSide::New)), *new),
                 ];
                 for (pane, side, content, line) in sides {
-                    match cell(content, line, *kind, side, view.gutter, columns(pane)) {
+                    let look = (*kind, jumped);
+                    match cell(content, line, look, side, view.gutter, columns(pane)) {
                         Some(line) => line.render(at(pane), buf),
                         None => filler(buf, at(pane), view.gutter),
                     }
@@ -159,9 +160,9 @@ fn draw_rows(frame: &mut Frame, view: &mut DiffView, body: Rect) {
 
 /// `12 - text` for one side of a line; `None` when that side is missing.
 fn cell(
-    (text, tokens, emph): (&Text, &[Token], &[Range<u32>]),
+    (text, marks): (&Text, Marks<'_>),
     line: Option<u32>,
-    kind: Kind,
+    (kind, jumped): (Kind, bool),
     side: &Side,
     gutter: usize,
     columns: Range<usize>,
@@ -171,30 +172,24 @@ fn cell(
         Kind::Context => (" ", DIM, Color::Reset),
         Kind::Change => (side.marker, side.fg, side.bg),
     };
+    let number = format!("{:>gutter$} ", i + 1);
     let mut spans = vec![
-        format!("{:>gutter$} ", i + 1).fg(fg),
+        if jumped {
+            number.fg(ACCENT).bold()
+        } else {
+            number.fg(fg)
+        },
         marker.fg(fg),
         " ".into(),
     ];
     let segments = text::segments(
         text.line(i),
         text.line_start(i),
-        tokens,
-        emph,
+        marks,
         columns.start,
         columns.len(),
     );
-    spans.extend(segments.into_iter().map(|(content, look)| {
-        let span = match look.class {
-            Some(class) => content.fg(class_color(class)),
-            None => content.into(),
-        };
-        if look.emph {
-            span.bg(side.emph_bg)
-        } else {
-            span
-        }
-    }));
+    spans.extend((segments.into_iter()).map(|(content, look)| styled(content, look, side.emph_bg)));
     Some(Line::from(spans).bg(bg))
 }
 
@@ -311,6 +306,30 @@ mod tests {
                 assert_eq!(cell.symbol(), " ", "x = {x}");
             }
         }
+    }
+
+    #[test]
+    fn go_to_line_target_has_an_accent_line_number() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new(vec![FileEntry {
+            path: "a.rs".into(),
+            status: Status::Modified,
+            added: 1,
+            removed: 1,
+            change: 0,
+        }]);
+        app.show(Some(Ok(FileDiff::new(b"a\n".to_vec(), b"b\n".to_vec()))));
+        if let DiffPane::Loaded(view) = &mut app.diff {
+            view.mark = view.rows.iter().position(|r| matches!(r, Row::Line { .. }));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).expect("test backend");
+        terminal
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .expect("draw");
+        // Header at row 1, the line at row 2; the old side's number starts the pane.
+        let number = &terminal.backend().buffer()[(30, 2)];
+        assert_eq!((number.symbol(), number.fg), ("1", ACCENT));
     }
 
     #[test]

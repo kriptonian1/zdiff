@@ -1,17 +1,28 @@
 mod diff;
+mod find;
+mod palette;
 mod sidebar;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Stylize};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use zdiff_highlight::Class;
 
 use crate::app::App;
+use crate::text::{Found, Look};
 
 const SIDEBAR_BG: Color = Color::Rgb(22, 24, 29);
 const SELECTED_BG: Color = Color::Rgb(42, 46, 56);
 const FOLD_BG: Color = Color::Rgb(32, 35, 42);
+/// Search matches; GitHub's attention amber, blended dark.
+const FIND_BG: Color = Color::Rgb(0x5c, 0x4a, 0x0f);
+/// The current search match; GitHub's `attention.emphasis`.
+const FIND_CURRENT_BG: Color = Color::Rgb(0x9e, 0x6a, 0x03);
+/// Modal background; GitHub's overlay color.
+const MODAL_BG: Color = Color::Rgb(0x16, 0x1b, 0x22);
+/// Modal badges such as ` LINE `; GitHub's accent blue.
+const BADGE_BG: Color = Color::Rgb(0x1f, 0x6f, 0xeb);
 /// Missing side of a line; GitHub's `canvas.subtle`.
 const FILLER_BG: Color = Color::Rgb(0x16, 0x1b, 0x22);
 /// Diagonal stripes, barely above [`FILLER_BG`] so they hint rather than distract.
@@ -36,11 +47,51 @@ const SIDEBAR_MIN: u16 = 24;
 const SIDEBAR_MAX: u16 = 40;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let width = sidebar_width(frame.area().width, app.sidebar_width);
+    let [panes, bottom] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    let width = if app.sidebar_hidden {
+        0
+    } else {
+        sidebar_width(panes.width, app.sidebar_width)
+    };
     let [sidebar, diff] =
-        Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(frame.area());
+        Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(panes);
+    footer(frame, app, bottom);
     sidebar::draw(frame, app, sidebar);
     diff::draw(frame, app, diff);
+    find::draw(frame, app);
+    palette::draw(frame, app);
+}
+
+/// ` ◧ files   ZDIFF  master · HEAD → worktree` on the left, the change totals on the right.
+fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
+    let (icon, color) = if app.sidebar_hidden {
+        ("◫", DIM)
+    } else {
+        ("◧", ACCENT)
+    };
+    let toggle = Span::from(format!(" {icon} files ")).fg(color);
+    app.sidebar_toggle = Rect {
+        width: u16::try_from(toggle.width()).unwrap_or(u16::MAX),
+        height: 1,
+        ..area
+    };
+    let left = vec![
+        toggle,
+        " ".into(),
+        format!(" {} ", app.repo_name.to_uppercase())
+            .fg(Color::Black)
+            .bg(BADGE_BG)
+            .bold(),
+        format!(" {} · {}", app.branch, app.compare).fg(DIM),
+    ];
+    // ponytail: totals summed per draw, O(files); cache them in `refresh` at 10k+ changed files.
+    let (files, added, removed) = (app.tree.files()).fold((0, 0, 0), |(n, a, r), (_, e)| {
+        (n + 1, a + e.added, r + e.removed)
+    });
+    let mut right = vec![format!("{files} files ").fg(DIM)];
+    right.extend(counts(added, removed));
+    frame.render_widget(right_aligned(left, right, area.width), area);
 }
 
 /// Sidebar columns for a `total`-wide terminal: the dragged width, else 30%.
@@ -49,6 +100,20 @@ fn sidebar_width(total: u16, dragged: Option<u16>) -> u16 {
     dragged
         .unwrap_or(auto)
         .clamp(SIDEBAR_MIN, (total / 2).max(SIDEBAR_MIN))
+}
+
+/// `text` in its look: syntax color, then the search or changed-word background.
+fn styled(text: String, look: Look, emph_bg: Color) -> Span<'static> {
+    let span = match look.class {
+        Some(class) => text.fg(class_color(class)),
+        None => text.into(),
+    };
+    match (look.found, look.emph) {
+        (Found::Current, _) => span.bg(FIND_CURRENT_BG),
+        (Found::Match, _) => span.bg(FIND_BG),
+        (Found::No, true) => span.bg(emph_bg),
+        (Found::No, false) => span,
+    }
 }
 
 /// GitHub's dark syntax palette (Primer `prettylights.syntax.*`).
@@ -61,6 +126,15 @@ fn class_color(class: Class) -> Color {
         Class::Tag => Color::Rgb(0x7e, 0xe7, 0x87),
         Class::Comment => Color::Rgb(0x91, 0x98, 0xa1),
     }
+}
+
+/// `spans` with `counts` pushed to the right edge of `width`, leaving the last column free.
+fn right_aligned<'a>(mut spans: Vec<Span<'a>>, counts: Vec<Span<'a>>, width: u16) -> Line<'a> {
+    let used: usize = spans.iter().chain(&counts).map(Span::width).sum();
+    let pad = usize::from(width).saturating_sub(used + 1).max(1);
+    spans.push(" ".repeat(pad).into());
+    spans.extend(counts);
+    Line::from(spans)
 }
 
 /// `+N -M` in green and red; zero counts are left out.
@@ -95,7 +169,48 @@ fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use zdiff_core::Status;
+
     use super::*;
+    use crate::app::FileEntry;
+
+    #[test]
+    fn footer_shows_repo_branch_compare_and_totals() {
+        let entry = |path: &str, added, removed| FileEntry {
+            path: path.into(),
+            status: Status::Modified,
+            added,
+            removed,
+            change: 0,
+        };
+        let mut app = App::new(vec![entry("a.rs", 2, 1), entry("b/c.rs", 1, 0)]);
+        app.repo_name = "zdiff".into();
+        app.branch = "master".into();
+        app.compare = "HEAD → worktree".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("test backend");
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect() };
+        let footer = row(5);
+        assert!(
+            footer.starts_with(" ◧ files   ZDIFF  master · HEAD → worktree"),
+            "{footer:?}"
+        );
+        assert!(footer.trim_end().ends_with("2 files +3 -1"), "{footer:?}");
+        assert_eq!(buffer[(11, 5)].bg, BADGE_BG);
+        assert_eq!(app.sidebar_toggle, Rect::new(0, 5, 9, 1));
+        assert!(row(0).contains('│'), "divider shown");
+
+        app.sidebar_hidden = true;
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect() };
+        assert!(row(5).starts_with(" ◫ files "), "{:?}", row(5));
+        assert!(!row(0).contains('│'), "no divider: {:?}", row(0));
+        assert_eq!(app.sidebar.width, 0);
+    }
 
     #[test]
     fn sidebar_width_is_auto_then_clamped() {

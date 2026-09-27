@@ -31,6 +31,18 @@ impl Default for Spec {
     }
 }
 
+/// The two sides as `old → new`, e.g. `HEAD → worktree`.
+impl fmt::Display for Spec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Worktree(rev) => write!(f, "{rev} → worktree"),
+            Self::Staged(rev) => write!(f, "{rev} → index"),
+            Self::Unstaged => f.write_str("index → worktree"),
+            Self::Revs(old, new) => write!(f, "{old} → {new}"),
+        }
+    }
+}
+
 /// How a file differs between the two sides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -117,7 +129,9 @@ impl Repo {
             source,
         };
         let inner = gix::discover(dir).map_err(|e| err(Some(e)))?;
-        let workdir = inner.workdir().ok_or_else(|| err(None))?.to_owned();
+        let workdir = inner.workdir().ok_or_else(|| err(None))?;
+        // gix keeps the workdir relative to `dir` (e.g. `../..`), which has no folder name.
+        let workdir = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_owned());
         Ok(Self { inner, workdir })
     }
 
@@ -125,6 +139,17 @@ impl Repo {
     #[must_use]
     pub fn workdir(&self) -> &Path {
         &self.workdir
+    }
+
+    /// The checked-out branch, the short commit id when detached, or `HEAD` if unreadable.
+    #[must_use]
+    pub fn head_name(&self) -> String {
+        match self.inner.head_name() {
+            Ok(Some(name)) => name.shorten().to_string(),
+            Ok(None) => (self.inner.head_id())
+                .map_or_else(|_| "HEAD".into(), |id| id.to_hex_with_len(7).to_string()),
+            Err(_) => "HEAD".into(),
+        }
     }
 
     /// Lists the files that differ between the two sides of `spec`, sorted by path.

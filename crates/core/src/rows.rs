@@ -101,6 +101,49 @@ pub fn expand(rows: &mut Vec<Row>, index: usize) -> bool {
     true
 }
 
+/// Which file a line number refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Old,
+    New,
+}
+
+impl Side {
+    /// `old` for [`Side::Old`], `new` for [`Side::New`].
+    #[must_use]
+    pub fn pick<T>(self, old: T, new: T) -> T {
+        match self {
+            Self::Old => old,
+            Self::New => new,
+        }
+    }
+}
+
+/// Row showing zero-based `line` on `side`, and its offset inside that row when the row is a fold.
+///
+/// `None` if no row shows `line`, such as past the end of that side.
+#[must_use]
+pub fn locate(rows: &[Row], side: Side, line: u32) -> Option<(usize, u32)> {
+    rows.iter().enumerate().find_map(|(i, row)| match *row {
+        Row::Line { old, new, .. } => (side.pick(old, new) == Some(line)).then_some((i, 0)),
+        Row::Fold { old, new, len } => {
+            let start = side.pick(old, new);
+            (start..start + len)
+                .contains(&line)
+                .then_some((i, line - start))
+        }
+        Row::Header { .. } => None,
+    })
+}
+
+/// Like [`locate`], opening the fold that hides `line`; returns its row.
+pub fn reveal(rows: &mut Vec<Row>, side: Side, line: u32) -> Option<usize> {
+    let (i, offset) = locate(rows, side, line)?;
+    // No-op unless row `i` is a fold.
+    expand(rows, i);
+    Some(i + offset as usize)
+}
+
 fn hunk_height(hunk: &Hunk) -> u32 {
     (hunk.old.end - hunk.old.start).max(hunk.new.end - hunk.new.start)
 }
@@ -270,5 +313,58 @@ mod tests {
             ]
         );
         assert!(!expand(&mut rows, 0), "not a fold");
+    }
+
+    #[test]
+    fn reveal_finds_visible_lines_and_opens_folds() {
+        let old = numbered(1..=20);
+        let mut rows = diff(&old, &old.replace("line 15\n", "fifteen\n")).rows(3);
+        let fold = rows
+            .iter()
+            .position(|r| matches!(r, Row::Fold { .. }))
+            .unwrap();
+        let visible = rows
+            .iter()
+            .position(|r| r == &line(Some(14), Some(14), Kind::Change));
+        assert_eq!(reveal(&mut rows, Side::New, 14), visible);
+
+        let row = reveal(&mut rows, Side::New, 2).unwrap();
+        assert_eq!(rows[row], line(Some(2), Some(2), Kind::Context));
+        assert!(!matches!(rows[fold], Row::Fold { .. }), "fold was opened");
+        assert_eq!(reveal(&mut rows, Side::New, 20), None, "past the end");
+    }
+
+    #[test]
+    fn reveal_uses_the_requested_side() {
+        let old = numbered(1..=6);
+        let new = old
+            .replace("line 2\n", "line 2\nextra\n")
+            .replace("line 5\n", "");
+        let mut rows = diff(&old, &new).rows(3);
+        let old_row = reveal(&mut rows, Side::Old, 3).unwrap();
+        let new_row = reveal(&mut rows, Side::New, 3).unwrap();
+        assert_ne!(old_row, new_row, "old line 3 is new line 4");
+        let deleted = reveal(&mut rows, Side::Old, 4).unwrap();
+        assert!(matches!(
+            rows[deleted],
+            Row::Line {
+                old: Some(4),
+                new: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn locate_finds_rows_without_opening_folds() {
+        let old = numbered(1..=20);
+        let rows = diff(&old, &old.replace("line 15\n", "fifteen\n")).rows(3);
+        let before = rows.clone();
+        let (fold, offset) = locate(&rows, Side::Old, 2).unwrap();
+        assert!(matches!(rows[fold], Row::Fold { .. }));
+        assert_eq!(offset, 2);
+        assert_eq!(rows, before, "rows untouched");
+        let visible = locate(&rows, Side::New, 14).map(|(i, _)| i);
+        assert_eq!(visible, reveal(&mut rows.clone(), Side::New, 14));
     }
 }

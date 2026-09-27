@@ -163,6 +163,24 @@ impl Tree {
         }
     }
 
+    /// Every file with its node index, including files inside closed folders.
+    pub fn files(&self) -> impl Iterator<Item = (usize, &FileEntry)> {
+        self.nodes.iter().enumerate().filter_map(|(i, n)| match n {
+            Node::File { entry, .. } => Some((i, entry)),
+            Node::Dir { .. } => None,
+        })
+    }
+
+    /// Opens every folder above `path`; returns the row it is then shown at.
+    pub fn reveal(&mut self, path: &Path) -> Option<usize> {
+        let before = self.collapsed.len();
+        self.collapsed.retain(|dir| !path.starts_with(dir));
+        if self.collapsed.len() != before {
+            self.update_rows();
+        }
+        self.find(path)
+    }
+
     pub fn into_collapsed(self) -> HashSet<PathBuf> {
         self.collapsed
     }
@@ -313,5 +331,15 @@ mod tests {
             t.file(y).map(|f| f.path.as_path()),
             Some(Path::new("a/c/y.rs"))
         );
+    }
+
+    #[test]
+    fn reveal_opens_closed_parents_and_files_sees_inside_them() {
+        let mut t = tree(&["a/b/x.rs", "a/c/y.rs", "top.rs"]);
+        t.set_open(0, false);
+        assert_eq!(t.files().count(), 3, "hidden files still listed");
+        assert_eq!(t.reveal(Path::new("a/c/y.rs")), Some(4));
+        assert_eq!(t.is_open(0), Some(true));
+        assert_eq!(t.reveal(Path::new("gone.rs")), None);
     }
 }

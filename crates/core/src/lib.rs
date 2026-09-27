@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 pub use diff::{FileDiff, Hunk, Text};
 pub use repo::{Change, Repo, Spec, Status};
-pub use rows::{Kind, Row, expand};
+pub use rows::{Kind, Row, Side, expand, locate, reveal};
 pub use words::WordChanges;
 
 /// Errors returned by zdiff-core.

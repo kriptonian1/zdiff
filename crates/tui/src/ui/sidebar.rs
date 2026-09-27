@@ -6,12 +6,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use zdiff_core::Status;
 
-use super::{ACCENT, DIM, GREEN, RED, SELECTED_BG, SIDEBAR_BG, YELLOW, counts};
+use super::{ACCENT, DIM, GREEN, RED, SELECTED_BG, SIDEBAR_BG, YELLOW, counts, right_aligned};
 use crate::app::App;
 use crate::tree::Node;
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     app.sidebar = area;
+    if area.is_empty() {
+        return;
+    }
     let block = Block::new().bg(SIDEBAR_BG);
     if app.tree.is_empty() {
         frame.render_widget(Paragraph::new(" No changes").fg(DIM).block(block), area);
@@ -87,14 +90,10 @@ fn node_row(node: &Node, open: bool, selected: bool, width: u16) -> Line<'_> {
             counts(entry.added, entry.removed)
         }
     };
-    let used: usize = spans.iter().chain(&counts).map(Span::width).sum();
-    let pad = usize::from(width).saturating_sub(used + 1).max(1);
-    spans.push(" ".repeat(pad).into());
-    spans.extend(counts);
-    Line::from(spans)
+    right_aligned(spans, counts, width)
 }
 
-fn status_color(status: Status) -> Color {
+pub(super) fn status_color(status: Status) -> Color {
     match status {
         Status::Added | Status::Untracked => GREEN,
         Status::Modified => YELLOW,
@@ -129,7 +128,8 @@ mod tests {
         // Leave out the divider column.
         let text = usize::from(SIDEBAR_MIN - 1);
         let screen = render(&mut app, 80, 5);
-        assert!(screen.iter().all(|row| row.chars().nth(text) == Some('│')));
+        let (_footer, panes) = screen.split_last().expect("rows");
+        assert!(panes.iter().all(|row| row.chars().nth(text) == Some('│')));
         let sidebar: Vec<String> = screen
             .iter()
             .map(|row| row.chars().take(text).collect())
