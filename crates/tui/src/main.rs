@@ -1,6 +1,7 @@
 mod app;
 mod snapshot;
 mod text;
+mod tree;
 mod ui;
 mod watch;
 

@@ -1,6 +1,8 @@
 //! How file text shows in the terminal: tabs, control characters, invalid UTF-8, wide characters.
 
-use std::iter;
+use std::iter::{self, Peekable};
+use std::ops::Range;
+use std::slice;
 
 use unicode_width::UnicodeWidthChar;
 use zdiff_highlight::{Class, Token};
@@ -8,31 +10,41 @@ use zdiff_highlight::{Class, Token};
 /// Columns a tab expands to; a raw tab would break column alignment.
 const TAB_WIDTH: usize = 4;
 
-/// A run of visible text that shares one syntax class.
-pub type Segment = (String, Option<Class>);
+/// How a run of text is drawn: its syntax class and whether it is a changed word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Look {
+    pub class: Option<Class>,
+    pub emph: bool,
+}
+
+/// A run of visible text that shares one [`Look`].
+pub type Segment = (String, Look);
 
 /// Terminal-safe slice of a line: skips `skip` columns, keeps at most `take`.
 ///
 /// Control characters become `�`, so file content cannot inject escape sequences.
 pub fn visible(bytes: &[u8], skip: usize, take: usize) -> String {
-    segments(bytes, 0, &[], skip, take)
+    segments(bytes, 0, &[], &[], skip, take)
         .into_iter()
         .map(|(text, _)| text)
         .collect()
 }
 
-/// Like [`visible`], split wherever the syntax class from `tokens` changes.
+/// Like [`visible`], split wherever the syntax class or word emphasis changes.
 ///
-/// `line_start` is the line's byte offset in the file that `tokens` index into.
+/// `line_start` is the line's byte offset in the file that `tokens` and `emph` index into.
 pub fn segments(
     bytes: &[u8],
     line_start: u32,
     tokens: &[Token],
+    emph: &[Range<u32>],
     skip: usize,
     take: usize,
 ) -> Vec<Segment> {
-    let first = tokens.partition_point(|t| t.end <= line_start);
-    let mut tokens = tokens[first..].iter().peekable();
+    let token_span = |t: &Token| (t.start, t.end);
+    let emph_span = |r: &Range<u32>| (r.start, r.end);
+    let mut tokens = from(tokens, line_start, token_span);
+    let mut emph = from(emph, line_start, emph_span);
     let mut out: Vec<Segment> = Vec::new();
     let mut column = 0;
     for (offset, c, width) in glyphs(bytes) {
@@ -42,13 +54,12 @@ pub fn segments(
         }
         if end > skip {
             let at = line_start as usize + offset;
-            while tokens.next_if(|t| t.end as usize <= at).is_some() {}
-            let class = tokens
-                .peek()
-                .filter(|t| t.start as usize <= at)
-                .map(|t| t.class);
-            if out.last().is_none_or(|(_, last)| *last != class) {
-                out.push((String::new(), class));
+            let look = Look {
+                class: covering(&mut tokens, at, token_span).map(|t| t.class),
+                emph: covering(&mut emph, at, emph_span).is_some(),
+            };
+            if out.last().is_none_or(|(_, last)| *last != look) {
+                out.push((String::new(), look));
             }
             let (text, _) = out.last_mut().expect("a segment was pushed above");
             if column < skip {
@@ -61,6 +72,23 @@ pub fn segments(
         column = end;
     }
     out
+}
+
+/// Cursor over sorted, non-overlapping `items`, starting at the first that ends after `start`.
+fn from<T>(items: &[T], start: u32, span: fn(&T) -> (u32, u32)) -> Peekable<slice::Iter<'_, T>> {
+    items[items.partition_point(|i| span(i).1 <= start)..]
+        .iter()
+        .peekable()
+}
+
+/// The item covering byte `at`, advancing `cursor` past items that end before it.
+fn covering<'a, T>(
+    cursor: &mut Peekable<slice::Iter<'a, T>>,
+    at: usize,
+    span: fn(&T) -> (u32, u32),
+) -> Option<&'a T> {
+    while cursor.next_if(|i| span(i).1 as usize <= at).is_some() {}
+    cursor.peek().copied().filter(|i| span(i).0 as usize <= at)
 }
 
 /// Width of the whole line in terminal columns.
@@ -132,16 +160,35 @@ mod tests {
         Token { start, end, class }
     }
 
+    fn look(class: Option<Class>, emph: bool) -> Look {
+        Look { class, emph }
+    }
+
     #[test]
     fn segments_split_where_the_class_changes() {
         // File "xx" + line "fn main", tokens in file offsets.
         let tokens = [token(2, 4, Class::Keyword), token(5, 9, Class::Entity)];
         assert_eq!(
-            segments(b"fn main", 2, &tokens, 0, 80),
+            segments(b"fn main", 2, &tokens, &[], 0, 80),
             [
-                ("fn".into(), Some(Class::Keyword)),
-                (" ".into(), None),
-                ("main".into(), Some(Class::Entity)),
+                ("fn".into(), look(Some(Class::Keyword), false)),
+                (" ".into(), Look::default()),
+                ("main".into(), look(Some(Class::Entity), false)),
+            ]
+        );
+    }
+
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "one emphasized range")]
+    fn segments_split_where_emphasis_changes_independent_of_class() {
+        let tokens = [token(0, 6, Class::String)];
+        assert_eq!(
+            segments(b"\"abcd\" x", 0, &tokens, &[3..7], 0, 80),
+            [
+                ("\"ab".into(), look(Some(Class::String), false)),
+                ("cd\"".into(), look(Some(Class::String), true)),
+                (" ".into(), look(None, true)),
+                ("x".into(), Look::default()),
             ]
         );
     }
@@ -150,13 +197,16 @@ mod tests {
     fn segments_keep_the_class_when_skipping_into_a_token() {
         let tokens = [token(0, 6, Class::String)];
         assert_eq!(
-            segments(b"\"abcd\" x", 0, &tokens, 2, 3),
-            [("bcd".into(), Some(Class::String))]
+            segments(b"\"abcd\" x", 0, &tokens, &[], 2, 3),
+            [("bcd".into(), look(Some(Class::String), false))]
         );
         let tabbed = [token(1, 2, Class::Keyword)];
         assert_eq!(
-            segments(b"\tk", 0, &tabbed, 2, 10),
-            [("  ".into(), None), ("k".into(), Some(Class::Keyword))]
+            segments(b"\tk", 0, &tabbed, &[], 2, 10),
+            [
+                ("  ".into(), Look::default()),
+                ("k".into(), look(Some(Class::Keyword), false))
+            ]
         );
     }
 

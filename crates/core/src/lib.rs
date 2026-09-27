@@ -6,12 +6,14 @@
 mod diff;
 mod repo;
 mod rows;
+mod words;
 
 use std::path::PathBuf;
 
 pub use diff::{FileDiff, Hunk, Text};
 pub use repo::{Change, Repo, Spec, Status};
 pub use rows::{Kind, Row, expand};
+pub use words::WordChanges;
 
 /// Errors returned by zdiff-core.
 #[derive(Debug, thiserror::Error)]

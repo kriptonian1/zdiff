@@ -12,26 +12,43 @@ use crate::app::App;
 const SIDEBAR_BG: Color = Color::Rgb(22, 24, 29);
 const SELECTED_BG: Color = Color::Rgb(42, 46, 56);
 const FOLD_BG: Color = Color::Rgb(32, 35, 42);
-const FILLER_BG: Color = Color::Rgb(16, 17, 20);
+/// Missing side of a line; GitHub's `canvas.subtle`.
+const FILLER_BG: Color = Color::Rgb(0x16, 0x1b, 0x22);
+/// Diagonal stripes, barely above [`FILLER_BG`] so they hint rather than distract.
+const STRIPE_FG: Color = Color::Rgb(0x21, 0x26, 0x2d);
+/// Columns between filler stripes; keep >= 3 or rows checker instead of slanting.
+const STRIPE_GAP: u32 = 3;
 /// GitHub's dark diff line colors (`rgba(248,81,73,.15)` / `rgba(46,160,67,.15)`), blended over `#0d1117`.
 const REMOVED_BG: Color = Color::Rgb(0x30, 0x1b, 0x1e);
 const ADDED_BG: Color = Color::Rgb(0x12, 0x26, 0x1e);
+/// GitHub's changed-word colors (same hues at 40%), blended over `#0d1117`.
+const REMOVED_EMPH_BG: Color = Color::Rgb(0x6b, 0x2b, 0x2b);
+const ADDED_EMPH_BG: Color = Color::Rgb(0x1a, 0x4a, 0x29);
 const DIM: Color = Color::Rgb(140, 146, 158);
 const ACCENT: Color = Color::Rgb(229, 192, 123);
 const GREEN: Color = Color::Rgb(152, 195, 121);
 const RED: Color = Color::Rgb(224, 108, 117);
 const YELLOW: Color = Color::Rgb(229, 192, 123);
 
-/// Sidebar width bounds in columns; narrower makes file names unreadable.
+/// Narrowest sidebar, also when dragged; narrower makes file names unreadable.
 const SIDEBAR_MIN: u16 = 24;
+/// Widest automatic sidebar; dragging can go up to half the terminal.
 const SIDEBAR_MAX: u16 = 40;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let width = (frame.area().width * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+    let width = sidebar_width(frame.area().width, app.sidebar_width);
     let [sidebar, diff] =
         Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(frame.area());
     sidebar::draw(frame, app, sidebar);
     diff::draw(frame, app, diff);
+}
+
+/// Sidebar columns for a `total`-wide terminal: the dragged width, else 30%.
+fn sidebar_width(total: u16, dragged: Option<u16>) -> u16 {
+    let auto = (total * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+    dragged
+        .unwrap_or(auto)
+        .clamp(SIDEBAR_MIN, (total / 2).max(SIDEBAR_MIN))
 }
 
 /// GitHub's dark syntax palette (Primer `prettylights.syntax.*`).
@@ -74,4 +91,19 @@ fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
         .chunks(usize::from(width))
         .map(|row| row.iter().map(Cell::symbol).collect())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_width_is_auto_then_clamped() {
+        assert_eq!(sidebar_width(100, None), 30);
+        assert_eq!(sidebar_width(80, None), SIDEBAR_MIN);
+        assert_eq!(sidebar_width(200, None), SIDEBAR_MAX);
+        assert_eq!(sidebar_width(100, Some(5)), SIDEBAR_MIN);
+        assert_eq!(sidebar_width(100, Some(70)), 50, "half the terminal");
+        assert_eq!(sidebar_width(100, Some(45)), 45);
+    }
 }

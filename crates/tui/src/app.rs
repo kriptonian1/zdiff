@@ -1,3 +1,4 @@
+use std::mem;
 use std::path::PathBuf;
 
 use crossterm::event::{
@@ -5,10 +6,11 @@ use crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
-use zdiff_core::{Error, FileDiff, Row, Status, Text};
+use zdiff_core::{Error, FileDiff, Row, Status, Text, WordChanges};
 use zdiff_highlight::{Language, Token};
 
 use crate::text;
+use crate::tree::Tree;
 
 /// Rows moved per scroll-wheel tick; the usual step in terminal apps.
 const WHEEL_STEP: isize = 3;
@@ -27,12 +29,6 @@ pub struct FileEntry {
     pub removed: u32,
     /// Index of this file's `Change` in the list the app was started with.
     pub change: usize,
-}
-
-#[derive(Debug)]
-pub enum Item {
-    Dir(Box<str>),
-    File(FileEntry),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +51,7 @@ pub struct DiffView {
     pub text_width: usize,
     pub old_tokens: Box<[Token]>,
     pub new_tokens: Box<[Token]>,
+    pub words: WordChanges,
 }
 
 #[derive(Debug)]
@@ -66,11 +63,11 @@ pub enum DiffPane {
 
 #[derive(Debug)]
 pub struct App {
-    pub items: Vec<Item>,
-    /// Item index of every file row, ascending; headers are never selectable.
-    file_rows: Vec<usize>,
-    /// Selected position in `file_rows`.
+    pub tree: Tree,
+    /// Selected sidebar row.
     cursor: usize,
+    /// Node index of the file the diff pane shows; stays put while a folder is selected.
+    file: Option<usize>,
     pub list: ListState,
     pub focus: Focus,
     pub diff: DiffPane,
@@ -78,66 +75,52 @@ pub struct App {
     pub sidebar: Rect,
     /// Diff body area from the last draw, for mouse hit-testing and paging.
     pub diff_area: Rect,
+    /// Width the user dragged the sidebar to; `None` keeps the automatic width.
+    pub sidebar_width: Option<u16>,
+    /// Whether the sidebar divider is being dragged.
+    pub resizing: bool,
     pub quit: bool,
 }
 
 impl App {
     pub fn new(files: Vec<FileEntry>) -> Self {
         let mut app = Self {
-            items: Vec::new(),
-            file_rows: Vec::new(),
+            tree: Tree::default(),
             cursor: 0,
+            file: None,
             list: ListState::default(),
             focus: Focus::Sidebar,
             diff: DiffPane::Empty,
             sidebar: Rect::default(),
             diff_area: Rect::default(),
+            sidebar_width: None,
+            resizing: false,
             quit: false,
         };
         app.set_files(files);
-        app.select(0);
+        let first_file = (0..app.tree.len()).find(|&row| app.tree.file_at(row).is_some());
+        app.select(first_file.unwrap_or(0));
         app
     }
 
-    /// Swaps in a new file list, keeping the selection on the same path when it still exists.
+    /// Swaps in a new file list, keeping the selection, shown file, and closed folders by path.
     pub fn refresh(&mut self, files: Vec<FileEntry>) {
-        let selected = self.selected_file().map(|f| f.path.clone());
+        let cursor_path = self.tree.node(self.cursor).map(|n| n.path().to_owned());
+        let file_path = self.selected_file().map(|f| f.path.clone());
         self.set_files(files);
-        let same = selected.and_then(|path| {
-            self.file_rows
-                .iter()
-                .position(|&row| matches!(&self.items[row], Item::File(f) if f.path == path))
-        });
-        let last = self.file_rows.len().saturating_sub(1);
+        self.file = file_path.and_then(|path| self.tree.find_file(&path));
+        let same = cursor_path.and_then(|path| self.tree.find(&path));
+        let last = self.tree.len().saturating_sub(1);
         self.select(same.unwrap_or(self.cursor.min(last)));
     }
 
-    /// Groups `files` under folder headers, sorted by folder then name.
-    fn set_files(&mut self, mut files: Vec<FileEntry>) {
-        files.sort_by(|a, b| {
-            (a.path.parent(), a.path.file_name()).cmp(&(b.path.parent(), b.path.file_name()))
-        });
-        self.items = Vec::with_capacity(files.len() * 2);
-        self.file_rows = Vec::with_capacity(files.len());
-        let mut current_dir = None;
-        for file in files {
-            let dir = file.path.parent().filter(|p| !p.as_os_str().is_empty());
-            if let Some(d) = dir
-                && current_dir.as_deref() != Some(d)
-            {
-                self.items.push(Item::Dir(d.display().to_string().into()));
-            }
-            current_dir = dir.map(ToOwned::to_owned);
-            self.file_rows.push(self.items.len());
-            self.items.push(Item::File(file));
-        }
+    fn set_files(&mut self, files: Vec<FileEntry>) {
+        self.tree = Tree::new(files, mem::take(&mut self.tree).into_collapsed());
     }
 
+    /// The file shown in the diff pane: the last file the sidebar cursor was on.
     pub fn selected_file(&self) -> Option<&FileEntry> {
-        match self.items.get(*self.file_rows.get(self.cursor)?) {
-            Some(Item::File(file)) => Some(file),
-            _ => None,
-        }
+        self.tree.file(self.file?)
     }
 
     /// Replaces the diff pane with the selected file's diff, scrolled to the top.
@@ -205,8 +188,29 @@ impl App {
             KeyCode::PageUp => self.move_by(-page),
             KeyCode::Char('g') | KeyCode::Home => self.move_by(isize::MIN),
             KeyCode::Char('G') | KeyCode::End => self.move_by(isize::MAX),
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Char('h') | KeyCode::Left => match self.tree.is_open(self.cursor) {
+                Some(true) => self.tree.set_open(self.cursor, false),
+                _ => self
+                    .tree
+                    .parent(self.cursor)
+                    .map(|row| self.select(row))
+                    .is_some(),
+            },
+            KeyCode::Char('l') | KeyCode::Right => match self.tree.is_open(self.cursor) {
+                Some(false) => self.tree.set_open(self.cursor, true),
+                Some(true) => self.move_by(1),
+                None => false,
+            },
             _ => false,
         }
+    }
+
+    /// Opens or closes the folder under the cursor; `false` on a file.
+    fn toggle(&mut self) -> bool {
+        self.tree
+            .is_open(self.cursor)
+            .is_some_and(|open| self.tree.set_open(self.cursor, !open))
     }
 
     fn diff_key(&mut self, code: KeyCode, ctrl: bool) -> bool {
@@ -235,6 +239,24 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let position = Position::new(mouse.column, mouse.row);
+        // Checked before hit-testing panes so a drag keeps going outside the sidebar.
+        let on_divider =
+            self.sidebar.contains(position) && mouse.column + 1 == self.sidebar.right();
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if on_divider => {
+                self.resizing = true;
+                return true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.resizing => {
+                let width = Some(mouse.column.saturating_sub(self.sidebar.x) + 1);
+                return mem::replace(&mut self.sidebar_width, width) != width;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.resizing => {
+                self.resizing = false;
+                return true;
+            }
+            _ => {}
+        }
         if self.sidebar.contains(position) {
             self.sidebar_mouse(mouse)
         } else if self.diff_area.contains(position) {
@@ -249,13 +271,12 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.focus = Focus::Sidebar;
                 let row = self.list.offset() + usize::from(mouse.row - self.sidebar.y);
-                match self.file_rows.binary_search(&row) {
-                    Ok(cursor) if cursor != self.cursor => {
-                        self.select(cursor);
-                        true
-                    }
-                    _ => false,
+                if row >= self.tree.len() {
+                    return false;
                 }
+                let moved = row != self.cursor;
+                self.select(row);
+                self.toggle() || moved
             }
             MouseEventKind::ScrollDown => self.move_by(WHEEL_STEP),
             MouseEventKind::ScrollUp => self.move_by(-WHEEL_STEP),
@@ -286,9 +307,9 @@ impl App {
         }
     }
 
-    /// Moves the selection by `delta` files, clamped to the first and last file.
+    /// Moves the selection by `delta` rows, clamped to the first and last row.
     fn move_by(&mut self, delta: isize) -> bool {
-        let Some(last) = self.file_rows.len().checked_sub(1) else {
+        let Some(last) = self.tree.len().checked_sub(1) else {
             return false;
         };
         let cursor = clamp_add(self.cursor, delta, last);
@@ -297,9 +318,12 @@ impl App {
         moved
     }
 
-    fn select(&mut self, cursor: usize) {
-        self.cursor = cursor;
-        self.list.select(self.file_rows.get(cursor).copied());
+    fn select(&mut self, row: usize) {
+        self.cursor = row;
+        self.list.select((row < self.tree.len()).then_some(row));
+        if let Some(file) = self.tree.file_at(row) {
+            self.file = Some(file);
+        }
     }
 
     fn stop(&mut self) -> bool {
@@ -312,7 +336,7 @@ impl DiffView {
     fn new(file: FileDiff, language: Option<Language>) -> Self {
         let rows = file.rows(CONTEXT_LINES);
         let gutter = file.old.len().max(file.new.len()).to_string().len();
-        // ponytail: highlights with the diff load on the UI thread; move both to a worker if big files stall input.
+        // ponytail: highlight + word diff run on the UI thread; use a worker if big files stall.
         let tokens = |text: &Text| {
             language.map_or_else(Box::default, |l| {
                 zdiff_highlight::highlight(l, text.bytes())
@@ -320,6 +344,7 @@ impl DiffView {
         };
         Self {
             old_tokens: tokens(&file.old),
+            words: file.word_changes(),
             new_tokens: tokens(&file.new),
             file,
             rows,
@@ -419,6 +444,7 @@ fn page(area: Rect) -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::Node;
 
     fn entry(path: &str) -> FileEntry {
         FileEntry {
@@ -446,11 +472,11 @@ mod tests {
     }
 
     fn labels(app: &App) -> Vec<String> {
-        app.items
-            .iter()
-            .map(|item| match item {
-                Item::Dir(d) => format!("{d}/"),
-                Item::File(f) => f.path.display().to_string(),
+        app.tree
+            .visible()
+            .map(|node| match node {
+                Node::Dir { label, .. } => format!("{label}/"),
+                Node::File { entry, .. } => entry.path.display().to_string(),
             })
             .collect()
     }
@@ -483,16 +509,17 @@ mod tests {
     }
 
     #[test]
-    fn groups_files_under_folder_headers() {
+    fn lists_files_in_a_folder_tree_and_starts_on_the_first_file() {
         let app = app(&["b/x.rs", "top.rs", "a/z.rs", "a/y.rs"]);
         assert_eq!(
             labels(&app),
-            ["top.rs", "a/", "a/y.rs", "a/z.rs", "b/", "b/x.rs"]
+            ["a/", "a/y.rs", "a/z.rs", "b/", "b/x.rs", "top.rs"]
         );
+        assert_eq!(selected(&app).as_deref(), Some("a/y.rs"));
     }
 
     #[test]
-    fn sidebar_keys_skip_headers_and_stop_at_ends() {
+    fn sidebar_keys_move_over_every_row_and_stop_at_ends() {
         let mut app = app(&["b/x.rs", "top.rs", "a/y.rs", "a/z.rs"]);
         let selected = |app: &mut App, code| {
             press(app, code);
@@ -501,8 +528,8 @@ mod tests {
         let down: Vec<_> = (0..4)
             .map(|_| selected(&mut app, KeyCode::Char('j')))
             .collect();
-        assert_eq!(down, [Some(2), Some(3), Some(5), Some(5)]);
-        assert_eq!(selected(&mut app, KeyCode::Char('k')), Some(3));
+        assert_eq!(down, [Some(2), Some(3), Some(4), Some(5)]);
+        assert_eq!(selected(&mut app, KeyCode::Char('k')), Some(4));
         assert_eq!(selected(&mut app, KeyCode::Char('g')), Some(0));
         assert_eq!(selected(&mut app, KeyCode::Char('G')), Some(5));
         press(&mut app, KeyCode::Char('q'));
@@ -510,16 +537,85 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_files_only() {
+    fn dragging_the_divider_resizes_the_sidebar() {
+        let mut app = app(&["a.rs", "b.rs"]);
+        app.sidebar = Rect::new(0, 0, 30, 10);
+        let left = MouseButton::Left;
+
+        assert!(app.handle(&mouse(MouseEventKind::Down(left), 29, 1)));
+        assert!(app.resizing);
+        assert!(app.handle(&mouse(MouseEventKind::Drag(left), 44, 3)));
+        assert_eq!(app.sidebar_width, Some(45));
+        assert!(
+            !app.handle(&mouse(MouseEventKind::Drag(left), 44, 4)),
+            "same width"
+        );
+        assert!(app.handle(&mouse(MouseEventKind::Up(left), 44, 4)));
+        assert!(!app.resizing);
+        assert!(!app.handle(&mouse(MouseEventKind::Drag(left), 60, 4)));
+        assert_eq!(app.sidebar_width, Some(45), "drag without grabbing");
+
+        app.handle(&mouse(MouseEventKind::Down(left), 5, 1));
+        assert!(!app.resizing, "clicking a row doesn't resize");
+        assert_eq!(app.list.selected(), Some(1));
+    }
+
+    #[test]
+    fn click_selects_files_and_toggles_folders() {
         let mut app = app(&["a/y.rs", "a/z.rs"]);
         app.sidebar = Rect::new(0, 2, 30, 10);
         let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), 5, row);
 
         assert!(app.handle(&click(4)));
-        assert_eq!(app.list.selected(), Some(2));
-        assert!(!app.handle(&click(2)), "header row is not selectable");
+        assert_eq!(selected(&app).as_deref(), Some("a/z.rs"));
+        assert!(app.handle(&click(2)), "folder row closes");
+        assert_eq!(labels(&app), ["a/"]);
+        assert_eq!(
+            selected(&app).as_deref(),
+            Some("a/z.rs"),
+            "diff keeps its file"
+        );
+        assert!(!app.handle(&click(3)), "empty space below the rows");
         assert!(!app.handle(&click(40)), "outside the sidebar");
-        assert_eq!(app.list.selected(), Some(2));
+        assert!(app.handle(&click(2)), "folder row opens again");
+        assert_eq!(labels(&app).len(), 3);
+    }
+
+    #[test]
+    fn arrows_close_open_and_walk_the_tree() {
+        let mut app = app(&["a/b/x.rs", "a/c/y.rs"]);
+        let at = |app: &App| app.list.selected();
+        assert_eq!(at(&app), Some(2), "starts on x.rs");
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(at(&app), Some(1), "file goes to its folder");
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(app.tree.is_open(1), Some(false), "open folder closes");
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(at(&app), Some(0), "closed folder goes to its parent");
+        assert!(press(&mut app, KeyCode::Left));
+        assert_eq!(app.tree.is_open(0), Some(false));
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(app.tree.is_open(0), Some(true));
+        assert!(press(&mut app, KeyCode::Right));
+        assert_eq!(at(&app), Some(1), "open folder steps into its first child");
+        assert!(press(&mut app, KeyCode::Enter));
+        assert_eq!(app.tree.is_open(1), Some(true), "Enter toggles");
+        assert_eq!(selected(&app).as_deref(), Some("a/b/x.rs"));
+    }
+
+    #[test]
+    fn refresh_keeps_closed_folders_closed() {
+        let mut app = app(&["a/x.rs", "top.rs"]);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter);
+        app.refresh(
+            ["a/x.rs", "a/y.rs", "top.rs"]
+                .into_iter()
+                .map(entry)
+                .collect(),
+        );
+        assert_eq!(labels(&app), ["a/", "top.rs"]);
+        assert_eq!(app.list.selected(), Some(0));
     }
 
     #[test]
