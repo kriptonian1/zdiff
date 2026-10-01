@@ -21,6 +21,13 @@ tempfile = "3"
 memchr = "2.8.3"
 notify = "8.2"
 unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ratatui-textarea = { version = "0.9", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false }
+ratatui-image = { version = "11.1", default-features = false }
+resvg = { version = "0.48", default-features = false }
+flate2 = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

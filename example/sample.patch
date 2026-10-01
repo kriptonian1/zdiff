@@ -1,0 +1,114 @@
+From 19c1724470546b2e672e19f19489c22947d6d1fc Mon Sep 17 00:00:00 2001
+From: Ada Example <ada@example.com>
+Date: Thu, 1 Oct 2026 10:00:00 +0530
+Subject: [PATCH] Make the timeout configurable in milliseconds
+
+Adds a retry count, renames the notes to a guide, and drops the legacy entry point.
+---
+ VERSION                     |   2 +-
+ assets/logo.png             | Bin 20 -> 20 bytes
+ "docs/caf\303\251.txt"      |   1 +
+ docs/{notes.md => guide.md} |   2 +-
+ src/config.rs               |   6 ++++--
+ src/greet.rs                |   2 +-
+ src/legacy.rs               |   3 ---
+ src/main.rs                 |   5 +++++
+ 8 files changed, 13 insertions(+), 8 deletions(-)
+ rename docs/{notes.md => guide.md} (53%)
+ delete mode 100644 src/legacy.rs
+ create mode 100644 src/main.rs
+
+diff --git a/VERSION b/VERSION
+index 2ebc2a0..a45a2af 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-version = 1
+\ No newline at end of file
++version = 2
+\ No newline at end of file
+diff --git a/assets/logo.png b/assets/logo.png
+index b437676b0b69749e011e1353750ee9638acde8c1..a80ba770ef1bde4b48403b666eaa3fc41113a070 100644
+GIT binary patch
+literal 20
+ZcmeAS@N?(olHy`uVBq!ia0vp^OaLY*0^k4u
+
+literal 20
+ZcmeAS@N?(olHy`uVBq!ia0vp^i~uGl0^a}t
+
+diff --git "a/docs/caf\303\251.txt" "b/docs/caf\303\251.txt"
+index da0d0dd..9580675 100644
+--- "a/docs/caf\303\251.txt"
++++ "b/docs/caf\303\251.txt"
+@@ -1 +1,2 @@
+ Café menu
++Croissant 3€
+diff --git a/docs/notes.md b/docs/guide.md
+similarity index 53%
+rename from docs/notes.md
+rename to docs/guide.md
+index 18bcd74..98e2ab4 100644
+--- a/docs/notes.md
++++ b/docs/guide.md
+@@ -1,4 +1,4 @@
+ # Notes
+ 
+ The server reads `config.toml`.
+-Run it with `cargo run`.
++Run it with `cargo run --release`.
+diff --git a/src/config.rs b/src/config.rs
+index 81d3049..245a4d7 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -5,7 +5,8 @@ use std::time::Duration;
+ pub struct Config {
+     pub name: String,
+     pub port: u16,
+-    pub timeout: u32,
++    pub timeout_ms: u64,
++    pub retries: u8,
+     pub verbose: bool,
+ }
+ 
+@@ -41,7 +42,8 @@ pub struct Config {
+ // filler line 30 keeps the two hunks apart
+ 
+ impl Config {
++    /// How long one request may take.
+     pub fn timeout(&self) -> Duration {
+-        Duration::from_secs(u64::from(self.timeout))
++        Duration::from_millis(self.timeout_ms)
+     }
+ }
+diff --git a/src/greet.rs b/src/greet.rs
+index 890cf17..ff35e2c 100644
+--- a/src/greet.rs
++++ b/src/greet.rs
+@@ -1,3 +1,3 @@
+ pub fn greet(name: &str) -> String {
+-    format!("hi {name}")
++    format!("hello, {name}!")
+ }
+diff --git a/src/legacy.rs b/src/legacy.rs
+deleted file mode 100644
+index 6f4aca1..0000000
+--- a/src/legacy.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-fn legacy() {
+-    println!("old path");
+-}
+diff --git a/src/main.rs b/src/main.rs
+new file mode 100644
+index 0000000..8534f2b
+--- /dev/null
++++ b/src/main.rs
+@@ -0,0 +1,5 @@
++use crate::greet::greet;
++
++fn main() {
++    println!("{}", greet("zdiff"));
++}
+-- 
+2.53.0
+

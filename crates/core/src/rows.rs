@@ -15,6 +15,9 @@ pub enum Row {
         new: Range<u32>,
         heading: Option<u32>,
     },
+    /// `len` lines starting at `old` / `new` that the diff doesn't have, such as the lines
+    /// between a patch's hunks; unlike a fold, it can't be opened.
+    Gap { old: u32, new: u32, len: u32 },
     /// A display line; a `None` side has no line here and renders as filler.
     Line {
         old: Option<u32>,
@@ -37,19 +40,25 @@ impl FileDiff {
     /// overlaps share one block, like `git diff`. Empty for binary or unchanged files.
     #[must_use]
     pub fn rows(&self, context: u32) -> Vec<Row> {
-        let capacity = self
-            .hunks
-            .iter()
-            .map(|h| hunk_height(h) + 2 * context + 2)
-            .sum::<u32>()
-            + 1;
-        let mut rows = Vec::with_capacity(capacity as usize);
+        if let Some(known) = &self.known {
+            return self.known_rows(known);
+        }
         let old_len = self.old.len();
+        // Saturating, so a huge `context` (show everything) can't overflow; capped at the most
+        // rows a file can have, so it can't over-allocate either.
+        let around = context.saturating_mul(2);
+        let capacity = (self.hunks.iter())
+            .map(|h| hunk_height(h).saturating_add(around).saturating_add(2))
+            .fold(1, u32::saturating_add)
+            .min(
+                old_len + self.new.len() + u32::try_from(self.hunks.len()).unwrap_or(u32::MAX) + 1,
+            );
+        let mut rows = Vec::with_capacity(capacity as usize);
         // First line on each side not yet covered by a row.
         let (mut old, mut new) = (0, 0);
         for block in self
             .hunks
-            .chunk_by(|a, b| b.old.start - a.old.end <= 2 * context)
+            .chunk_by(|a, b| b.old.start - a.old.end <= around)
         {
             let (first, last) = (&block[0], &block[block.len() - 1]);
             let lead = context.min(first.old.start - old);
@@ -74,6 +83,40 @@ impl FileDiff {
         }
         if !self.hunks.is_empty() {
             push_fold(&mut rows, old, new, old_len - old);
+        }
+        rows
+    }
+
+    /// Rows for a partial diff: one block per known range, exactly as the patch has it, with
+    /// [`Row::Gap`]s for the unknown lines before and between them; `context` doesn't apply.
+    fn known_rows(&self, known: &[Hunk]) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let (mut old, mut new) = (0, 0);
+        let mut hunks = self.hunks.iter().peekable();
+        for Hunk {
+            old: known_old,
+            new: known_new,
+        } in known
+        {
+            let len = known_old.start.saturating_sub(old);
+            if len > 0 {
+                rows.push(Row::Gap { old, new, len });
+            }
+            rows.push(Row::Header {
+                old: known_old.clone(),
+                new: known_new.clone(),
+                heading: None,
+            });
+            let (mut o, mut n) = (known_old.start, known_new.start);
+            while let Some(hunk) =
+                hunks.next_if(|h| h.old.start < known_old.end || h.new.start < known_new.end)
+            {
+                rows.extend(context_lines(o, n, hunk.old.start - o));
+                push_change(&mut rows, hunk);
+                (o, n) = (hunk.old.end, hunk.new.end);
+            }
+            rows.extend(context_lines(o, n, known_old.end - o));
+            (old, new) = (known_old.end, known_new.end);
         }
         rows
     }
@@ -132,8 +175,41 @@ pub fn locate(rows: &[Row], side: Side, line: u32) -> Option<(usize, u32)> {
                 .contains(&line)
                 .then_some((i, line - start))
         }
-        Row::Header { .. } => None,
+        Row::Header { .. } | Row::Gap { .. } => None,
     })
+}
+
+/// Unified-view rows from split `rows`: each paired change block becomes its removed lines,
+/// then its added lines; context, headers, and folds are unchanged.
+#[must_use]
+pub fn unified(rows: &[Row]) -> Vec<Row> {
+    let added_row = |new| Row::Line {
+        old: None,
+        new: Some(new),
+        kind: Kind::Change,
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    let mut added = Vec::new();
+    for row in rows {
+        if let Row::Line {
+            old,
+            new,
+            kind: Kind::Change,
+        } = *row
+        {
+            out.extend(old.map(|old| Row::Line {
+                old: Some(old),
+                new: None,
+                kind: Kind::Change,
+            }));
+            added.extend(new);
+        } else {
+            out.extend(added.drain(..).map(added_row));
+            out.push(row.clone());
+        }
+    }
+    out.extend(added.drain(..).map(added_row));
+    out
 }
 
 /// Like [`locate`], opening the fold that hides `line`; returns its row.
@@ -290,7 +366,7 @@ mod tests {
                     seen_old.extend(old);
                     seen_new.extend(new);
                 }
-                Row::Header { .. } => {}
+                Row::Header { .. } | Row::Gap { .. } => {}
             }
         }
         assert_eq!(seen_old, (0..d.old.len()).collect::<Vec<_>>());
@@ -353,6 +429,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn unified_lists_removed_then_added_lines_per_block() {
+        let line = |old, new, kind| Row::Line { old, new, kind };
+        let header = Row::Header {
+            old: 0..2,
+            new: 0..3,
+            heading: None,
+        };
+        let fold = Row::Fold {
+            old: 5,
+            new: 6,
+            len: 4,
+        };
+        let split = [
+            header.clone(),
+            line(Some(0), Some(0), Kind::Context),
+            line(Some(1), Some(1), Kind::Change),
+            line(None, Some(2), Kind::Change),
+            line(Some(2), Some(3), Kind::Context),
+            fold.clone(),
+            line(Some(9), None, Kind::Change),
+        ];
+        assert_eq!(
+            unified(&split),
+            [
+                header,
+                line(Some(0), Some(0), Kind::Context),
+                line(Some(1), None, Kind::Change),
+                line(None, Some(1), Kind::Change),
+                line(None, Some(2), Kind::Change),
+                line(Some(2), Some(3), Kind::Context),
+                fold,
+                line(Some(9), None, Kind::Change),
+            ]
+        );
+    }
+
+    #[test]
+    fn unlimited_context_shows_every_line_in_one_block() {
+        let old = numbered(1..=40);
+        let new = old
+            .replace("line 5\n", "five\n")
+            .replace("line 35\n", "thirty-five\n");
+        let rows = diff(&old, &new).rows(u32::MAX);
+        let headers = rows
+            .iter()
+            .filter(|r| matches!(r, Row::Header { .. }))
+            .count();
+        assert_eq!(headers, 1, "both changes merge into one block");
+        assert!(!rows.iter().any(|r| matches!(r, Row::Fold { .. })));
+        assert_eq!(rows.len(), 1 + 40, "a header, then one row per line");
     }
 
     #[test]

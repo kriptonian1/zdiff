@@ -1,8 +1,9 @@
+use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use zdiff_core::{Change, Error, Hunk, Repo, Spec, Status};
+use zdiff_core::{Change, Error, Hunk, Patch, Repo, Spec, Staged, Status};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -219,4 +220,310 @@ fn non_repo_is_a_discover_error() {
         Repo::discover(dir.path()),
         Err(Error::Discover { .. })
     ));
+}
+
+/// `git status --porcelain`, untrimmed: its first column is often a space.
+fn status(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir)
+        .output()
+        .expect("git is installed");
+    String::from_utf8(out.stdout)
+        .expect("git prints utf-8")
+        .trim_end()
+        .to_owned()
+}
+
+/// Saves an identity in the repo's own config: gix reads it there, not from `-c` flags.
+fn configure(dir: &Path) {
+    git(dir, &["config", "user.name", "t"]);
+    git(dir, &["config", "user.email", "t@t"]);
+    git(dir, &["config", "commit.gpgsign", "false"]);
+}
+
+fn staged(repo: &Repo) -> Vec<(String, Staged)> {
+    (repo.changes(&Spec::default()).expect("changes").iter())
+        .map(|c| (c.path.display().to_string(), c.staged()))
+        .collect()
+}
+
+fn paths(names: &[&str]) -> Vec<PathBuf> {
+    names.iter().map(PathBuf::from).collect()
+}
+
+#[test]
+fn staged_state_is_no_partly_or_fully() {
+    let dir = init();
+    for name in ["full", "part", "edit"] {
+        fs::write(dir.path().join(name), "1\n").unwrap();
+    }
+    commit(dir.path());
+    fs::write(dir.path().join("full"), "2\n").unwrap();
+    fs::write(dir.path().join("part"), "2\n").unwrap();
+    git(dir.path(), &["add", "full", "part"]);
+    fs::write(dir.path().join("part"), "3\n").unwrap();
+    fs::write(dir.path().join("edit"), "2\n").unwrap();
+    fs::write(dir.path().join("new"), "1\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert_eq!(
+        staged(&repo),
+        [
+            ("edit".into(), Staged::No),
+            ("full".into(), Staged::Fully),
+            ("new".into(), Staged::No),
+            ("part".into(), Staged::Partly),
+        ]
+    );
+    let unstaged = repo.changes(&Spec::Unstaged).unwrap();
+    assert!(
+        unstaged.iter().all(|c| c.staged() == Staged::No),
+        "only against HEAD"
+    );
+}
+
+#[test]
+fn apply_stages_new_modified_deleted_executable_and_symlink() {
+    let dir = init();
+    fs::write(dir.path().join("mod"), "1\n").unwrap();
+    fs::write(dir.path().join("gone"), "1\n").unwrap();
+    commit(dir.path());
+    fs::write(dir.path().join("mod"), "2\n").unwrap();
+    fs::remove_file(dir.path().join("gone")).unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/new"), "new\n").unwrap();
+    let run = dir.path().join("run.sh");
+    fs::write(&run, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("mod", dir.path().join("link")).unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    let all = paths(&["gone", "link", "mod", "run.sh", "sub/new"]);
+    repo.apply(&all, &[]).unwrap();
+
+    assert_eq!(
+        git(dir.path(), &["diff", "--cached", "--name-status"]),
+        "D\tgone\nA\tlink\nM\tmod\nA\trun.sh\nA\tsub/new"
+    );
+    let modes = git(dir.path(), &["ls-files", "-s", "link", "run.sh"]);
+    assert!(
+        modes.starts_with("120000 ") && modes.contains("\n100755 "),
+        "{modes}"
+    );
+    assert_eq!(
+        status(dir.path()),
+        "D  gone\nA  link\nM  mod\nA  run.sh\nA  sub/new"
+    );
+    assert!(staged(&repo).iter().all(|(_, s)| *s == Staged::Fully));
+}
+
+#[test]
+fn apply_runs_the_crlf_filter() {
+    let dir = init();
+    git(dir.path(), &["config", "core.autocrlf", "true"]);
+    fs::write(dir.path().join("a.txt"), "a\r\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    repo.apply(&paths(&["a.txt"]), &[]).unwrap();
+    assert_eq!(git(dir.path(), &["show", ":a.txt"]), "a");
+    assert_eq!(
+        git(dir.path(), &["cat-file", "-s", ":a.txt"]),
+        "2",
+        "stored as a\\n"
+    );
+}
+
+#[test]
+fn apply_unstages_back_to_head() {
+    let dir = init();
+    fs::write(dir.path().join("mod"), "1\n").unwrap();
+    fs::write(dir.path().join("gone"), "1\n").unwrap();
+    commit(dir.path());
+    fs::write(dir.path().join("mod"), "2\n").unwrap();
+    fs::write(dir.path().join("new"), "1\n").unwrap();
+    git(dir.path(), &["add", "mod", "new"]);
+    git(dir.path(), &["rm", "-q", "gone"]);
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    repo.apply(&[], &paths(&["gone", "mod", "new"])).unwrap();
+    assert_eq!(git(dir.path(), &["diff", "--cached", "--name-only"]), "");
+    assert_eq!(status(dir.path()), " D gone\n M mod\n?? new");
+}
+
+#[test]
+fn commit_records_the_index_on_head() {
+    let dir = init();
+    configure(dir.path());
+    fs::write(dir.path().join("a"), "1\n").unwrap();
+    fs::write(dir.path().join("b"), "1\n").unwrap();
+    let before = commit(dir.path());
+    fs::write(dir.path().join("a"), "2\n").unwrap();
+    fs::write(dir.path().join("b"), "2\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    repo.apply(&paths(&["a"]), &[]).unwrap();
+    let id = repo.commit("feat: change a\n\nbody").unwrap();
+
+    assert_eq!(id, git(dir.path(), &["rev-parse", "--short=7", "HEAD"]));
+    assert_eq!(
+        git(dir.path(), &["log", "-1", "--format=%s|%b|%P"]),
+        format!("feat: change a|body\n|{before}")
+    );
+    assert_eq!(
+        git(dir.path(), &["diff", "HEAD~1", "HEAD", "--name-only"]),
+        "a"
+    );
+    assert_eq!(status(dir.path()), " M b", "b stays unstaged");
+}
+
+#[test]
+fn first_commit_on_an_unborn_branch() {
+    let dir = init();
+    configure(dir.path());
+    fs::write(dir.path().join("a"), "1\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    repo.apply(&paths(&["a"]), &[]).unwrap();
+    repo.commit("first").unwrap();
+    assert_eq!(git(dir.path(), &["log", "--format=%s|%P"]), "first|");
+    assert_eq!(git(dir.path(), &["ls-tree", "--name-only", "HEAD"]), "a");
+}
+
+#[test]
+fn commit_refuses_nothing_signing_and_conflicts() {
+    let refused = |result: Result<String, Error>| match result {
+        Err(Error::Refused(why)) => why,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    let dir = init();
+    configure(dir.path());
+    fs::write(dir.path().join("a"), "1\n").unwrap();
+    commit(dir.path());
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert_eq!(refused(repo.commit(" \n\n")), "the commit message is empty");
+    assert_eq!(refused(repo.commit("m")), "nothing to commit");
+
+    git(dir.path(), &["config", "commit.gpgsign", "true"]);
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert!(refused(repo.commit("m")).contains("signing"));
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+
+    git(dir.path(), &["checkout", "-q", "-b", "other"]);
+    fs::write(dir.path().join("a"), "other\n").unwrap();
+    commit(dir.path());
+    git(dir.path(), &["checkout", "-q", "-"]);
+    fs::write(dir.path().join("a"), "main\n").unwrap();
+    commit(dir.path());
+    let merge = Command::new("git")
+        .args(["merge", "-q", "other"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!merge.status.success(), "the merge conflicts");
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert_eq!(refused(repo.commit("m")), "resolve conflicts first");
+}
+
+#[test]
+fn apply_fails_cleanly_while_the_index_is_locked() {
+    let dir = init();
+    fs::write(dir.path().join("a"), "1\n").unwrap();
+    commit(dir.path());
+    fs::write(dir.path().join("a"), "2\n").unwrap();
+    fs::write(dir.path().join(".git/index.lock"), "").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert!(matches!(
+        repo.apply(&paths(&["a"]), &[]),
+        Err(Error::Git(_))
+    ));
+    assert_eq!(status(dir.path()), " M a", "index untouched");
+}
+
+fn numbered(n: u32) -> String {
+    (1..=n).fold(String::new(), |mut out, i| {
+        writeln!(out, "line {i}").expect("writing to a String cannot fail");
+        out
+    })
+}
+
+fn patch_of(dir: &Path, args: &[&str]) -> Patch {
+    Patch::parse(git(dir, args).into_bytes()).expect("git's own diff parses")
+}
+
+#[test]
+fn a_patch_with_both_blobs_in_the_repo_shows_the_exact_files() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), numbered(30)).unwrap();
+    commit(dir.path());
+    let v2 = numbered(30).replace("line 15\n", "fifteen\n");
+    fs::write(dir.path().join("a.txt"), &v2).unwrap();
+    commit(dir.path());
+    let patch = patch_of(dir.path(), &["diff", "HEAD~1", "HEAD"]);
+    let repo = Repo::discover(dir.path()).unwrap();
+
+    let diff = patch.full_diff(0, Some(&repo));
+    assert!(diff.known.is_none(), "whole files, no gaps");
+    assert_eq!(diff.new.bytes(), v2.as_bytes());
+    assert_eq!(diff.old.len(), 30);
+    assert!(
+        patch.diff(0).known.is_some(),
+        "the hunks-only view is still there"
+    );
+}
+
+#[test]
+fn the_old_blob_plus_the_hunks_rebuild_the_new_file() {
+    let dir = init();
+    fs::write(dir.path().join("b.txt"), "keep\nold").unwrap();
+    commit(dir.path());
+    // `git diff` against the worktree writes no blob for the new side.
+    fs::write(dir.path().join("b.txt"), "keep\nnew").unwrap();
+    let patch = patch_of(dir.path(), &["diff"]);
+    fs::write(dir.path().join("b.txt"), "something else entirely\n").unwrap();
+    let repo = Repo::discover(dir.path()).unwrap();
+
+    let diff = patch.full_diff(0, Some(&repo));
+    assert!(diff.known.is_none());
+    assert_eq!(
+        diff.new.bytes(),
+        b"keep\nnew",
+        "no final newline, as in the patch"
+    );
+}
+
+#[test]
+fn a_plain_patch_applies_to_the_worktree_or_falls_back() {
+    let dir = init();
+    fs::write(dir.path().join("c.txt"), "1\n2\n3\n").unwrap();
+    let patch = Patch::parse(b"--- a/c.txt\n+++ b/c.txt\n@@ -2 +2 @@\n-2\n+two\n".to_vec())
+        .expect("parses");
+    let repo = Repo::discover(dir.path()).unwrap();
+    let diff = patch.full_diff(0, Some(&repo));
+    assert!(diff.known.is_none());
+    assert_eq!(diff.new.bytes(), b"1\ntwo\n3\n");
+
+    fs::write(dir.path().join("c.txt"), "1\nTWO\n3\n").unwrap();
+    let diff = patch.full_diff(0, Some(&repo));
+    assert!(
+        diff.known.is_some(),
+        "other content: hunks only, never wrong text"
+    );
+}
+
+#[test]
+fn an_added_file_needs_no_base() {
+    let dir = init();
+    // `1234567` isn't in this repo, so only the empty old side plus the hunk can rebuild it.
+    let patch = Patch::parse(
+        b"diff --git a/n.txt b/n.txt\nnew file mode 100644\nindex 0000000..1234567\n\
+          --- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+            .to_vec(),
+    )
+    .expect("parses");
+    let repo = Repo::discover(dir.path()).unwrap();
+    let diff = patch.full_diff(0, Some(&repo));
+    assert!(diff.known.is_none());
+    assert_eq!(diff.new.bytes(), b"one\ntwo\n");
 }

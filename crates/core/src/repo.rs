@@ -72,6 +72,15 @@ impl fmt::Display for Status {
     }
 }
 
+/// Whether a file's change is in the index; only [`Spec::Worktree`] reports more than `No`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staged {
+    No,
+    /// Some of the change is staged and the worktree differs again.
+    Partly,
+    Fully,
+}
+
 /// One changed file, as listed by [`Repo::changes`].
 #[derive(Debug, Clone)]
 pub struct Change {
@@ -80,6 +89,7 @@ pub struct Change {
     old: Source,
     new: Source,
     untracked: bool,
+    staged: Staged,
 }
 
 impl Change {
@@ -93,6 +103,31 @@ impl Change {
             (Source::Missing, _) => Status::Added,
             (_, Source::Missing) => Status::Deleted,
             _ => Status::Modified,
+        }
+    }
+
+    #[must_use]
+    pub fn staged(&self) -> Staged {
+        self.staged
+    }
+}
+
+/// Which status streams reported a path.
+#[derive(Debug, Clone, Copy, Default)]
+struct Flags {
+    untracked: bool,
+    /// HEAD and the index differ.
+    index: bool,
+    /// The index and the worktree differ.
+    worktree: bool,
+}
+
+impl Flags {
+    fn staged(self) -> Staged {
+        match (self.index, self.worktree) {
+            (true, false) => Staged::Fully,
+            (true, true) => Staged::Partly,
+            (false, _) => Staged::No,
         }
     }
 }
@@ -113,8 +148,8 @@ enum Side<'repo> {
 /// An opened git repository with a worktree.
 #[derive(Debug)]
 pub struct Repo {
-    inner: gix::Repository,
-    workdir: PathBuf,
+    pub(crate) inner: gix::Repository,
+    pub(crate) workdir: PathBuf,
 }
 
 impl Repo {
@@ -176,12 +211,22 @@ impl Repo {
             }
             _ => self.status_paths(None, true)?,
         };
-        // Parallel status is unordered; both streams may report one path.
-        paths.sort_unstable();
-        paths.dedup_by(|a, b| a.0 == b.0);
+        // Parallel status is unordered; both streams may report one path, so merge their flags.
+        paths.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        paths.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            if same {
+                kept.1.untracked |= later.1.untracked;
+                kept.1.index |= later.1.index;
+                kept.1.worktree |= later.1.worktree;
+            }
+            same
+        });
+        // Staging is only offered against HEAD, where both streams ran.
+        let staging = matches!(spec, Spec::Worktree(_));
 
         let mut changes = Vec::with_capacity(paths.len());
-        for (path, untracked) in paths {
+        for (path, flags) in paths {
             let old = self.source(&old, path.as_bstr())?;
             let new = self.source(&new, path.as_bstr())?;
             // Same blob (staged then reverted) or absent on both sides.
@@ -191,7 +236,8 @@ impl Repo {
                     path: gix::path::from_bstring(path),
                     old,
                     new,
-                    untracked,
+                    untracked: flags.untracked,
+                    staged: if staging { flags.staged() } else { Staged::No },
                 });
             }
         }
@@ -209,7 +255,20 @@ impl Repo {
         Ok(FileDiff::new(old, new))
     }
 
-    fn tree(&self, rev: &str) -> Result<gix::Tree<'_>, Error> {
+    /// The blob whose id starts with `hex`, if this repository has exactly one.
+    #[must_use]
+    pub fn blob(&self, hex: &str) -> Option<Vec<u8>> {
+        let id = self.inner.rev_parse_single(hex).ok()?;
+        Some(self.inner.find_blob(id).ok()?.take_data())
+    }
+
+    /// The worktree file at `path` (relative to the root), or a symlink's target.
+    #[must_use]
+    pub fn worktree_file(&self, path: &Path) -> Option<Vec<u8>> {
+        read_worktree(&self.workdir.join(path)).ok()
+    }
+
+    pub(crate) fn tree(&self, rev: &str) -> Result<gix::Tree<'_>, Error> {
         if rev == "HEAD" && self.inner.head()?.is_unborn() {
             return Ok(self.inner.empty_tree());
         }
@@ -220,7 +279,7 @@ impl Repo {
         &self,
         head: Option<ObjectId>,
         worktree: bool,
-    ) -> Result<Vec<(BString, bool)>, Error> {
+    ) -> Result<Vec<(BString, Flags)>, Error> {
         // ponytail: renames show as delete + add; add Status::Renamed when needed.
         let status = self
             .inner
@@ -244,7 +303,11 @@ impl Repo {
         for item in status.head_tree(head).into_iter(Vec::new())? {
             match item? {
                 gix::status::Item::TreeIndex(change) => {
-                    paths.push((change.location().to_owned(), false));
+                    let flags = Flags {
+                        index: true,
+                        ..Flags::default()
+                    };
+                    paths.push((change.location().to_owned(), flags));
                 }
                 gix::status::Item::IndexWorktree(item) if worktree => {
                     paths.extend(worktree_path(&item));
@@ -292,7 +355,7 @@ impl Repo {
     }
 }
 
-fn read_worktree(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_worktree(path: &Path) -> io::Result<Vec<u8>> {
     // Git stores a symlink's target path, not the pointed-to content.
     if fs::symlink_metadata(path)?.is_symlink() {
         Ok(gix::path::into_bstr(fs::read_link(path)?)
@@ -303,7 +366,7 @@ fn read_worktree(path: &Path) -> io::Result<Vec<u8>> {
     }
 }
 
-fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<(BString, bool)>, Error> {
+fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<(BString, Flags)>, Error> {
     let mut paths = Vec::new();
     old.changes()?
         .options(|o| {
@@ -311,7 +374,7 @@ fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<(BString, 
         })
         .for_each_to_obtain_tree(new, |change| {
             if !change.entry_mode().is_tree() {
-                paths.push((change.location().to_owned(), false));
+                paths.push((change.location().to_owned(), Flags::default()));
             }
             Ok(gix::object::tree::diff::Action::Continue(()))
         })?;
@@ -319,7 +382,7 @@ fn tree_paths(old: &gix::Tree<'_>, new: &gix::Tree<'_>) -> Result<Vec<(BString, 
 }
 
 /// The item's path and whether it is untracked; `None` for ignored or pruned entries.
-fn worktree_path(item: &index_worktree::Item) -> Option<(BString, bool)> {
+fn worktree_path(item: &index_worktree::Item) -> Option<(BString, Flags)> {
     let untracked = match item {
         index_worktree::Item::DirectoryContents { entry, .. } => {
             if entry.status != gix::dir::entry::Status::Untracked {
@@ -329,5 +392,10 @@ fn worktree_path(item: &index_worktree::Item) -> Option<(BString, bool)> {
         }
         _ => false,
     };
-    Some((item.rela_path().to_owned(), untracked))
+    let flags = Flags {
+        untracked,
+        worktree: true,
+        index: false,
+    };
+    Some((item.rela_path().to_owned(), flags))
 }

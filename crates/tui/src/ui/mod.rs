@@ -1,74 +1,69 @@
 mod diff;
 mod find;
+mod menu;
 mod palette;
 mod sidebar;
+mod theme;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use zdiff_highlight::Class;
+use ratatui::widgets::Block;
 
-use crate::app::App;
+use crate::app::{App, Notice};
 use crate::text::{Found, Look};
+pub(crate) use theme::Colors;
+pub use theme::Theme;
 
-const SIDEBAR_BG: Color = Color::Rgb(22, 24, 29);
-const SELECTED_BG: Color = Color::Rgb(42, 46, 56);
-const FOLD_BG: Color = Color::Rgb(32, 35, 42);
-/// Search matches; GitHub's attention amber, blended dark.
-const FIND_BG: Color = Color::Rgb(0x5c, 0x4a, 0x0f);
-/// The current search match; GitHub's `attention.emphasis`.
-const FIND_CURRENT_BG: Color = Color::Rgb(0x9e, 0x6a, 0x03);
-/// Modal background; GitHub's overlay color.
-const MODAL_BG: Color = Color::Rgb(0x16, 0x1b, 0x22);
-/// Modal badges such as ` LINE `; GitHub's accent blue.
-const BADGE_BG: Color = Color::Rgb(0x1f, 0x6f, 0xeb);
-/// Missing side of a line; GitHub's `canvas.subtle`.
-const FILLER_BG: Color = Color::Rgb(0x16, 0x1b, 0x22);
-/// Diagonal stripes, barely above [`FILLER_BG`] so they hint rather than distract.
-const STRIPE_FG: Color = Color::Rgb(0x21, 0x26, 0x2d);
+/// The default theme's colors, for tests that check what was drawn.
+#[cfg(test)]
+const DARK: &Colors = Theme::GithubDark.colors();
+
 /// Columns between filler stripes; keep >= 3 or rows checker instead of slanting.
 const STRIPE_GAP: u32 = 3;
-/// GitHub's dark diff line colors (`rgba(248,81,73,.15)` / `rgba(46,160,67,.15)`), blended over `#0d1117`.
-const REMOVED_BG: Color = Color::Rgb(0x30, 0x1b, 0x1e);
-const ADDED_BG: Color = Color::Rgb(0x12, 0x26, 0x1e);
-/// GitHub's changed-word colors (same hues at 40%), blended over `#0d1117`.
-const REMOVED_EMPH_BG: Color = Color::Rgb(0x6b, 0x2b, 0x2b);
-const ADDED_EMPH_BG: Color = Color::Rgb(0x1a, 0x4a, 0x29);
-const DIM: Color = Color::Rgb(140, 146, 158);
-const ACCENT: Color = Color::Rgb(229, 192, 123);
-const GREEN: Color = Color::Rgb(152, 195, 121);
-const RED: Color = Color::Rgb(224, 108, 117);
-const YELLOW: Color = Color::Rgb(229, 192, 123);
-
 /// Narrowest sidebar, also when dragged; narrower makes file names unreadable.
 const SIDEBAR_MIN: u16 = 24;
 /// Widest automatic sidebar; dragging can go up to half the terminal.
 const SIDEBAR_MAX: u16 = 40;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [panes, bottom] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    let [bar, panes, bottom] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    let c = app.shown_theme().colors();
+    frame.render_widget(Block::new().fg(c.fg).bg(c.bg), frame.area());
     let width = if app.sidebar_hidden {
         0
     } else {
         sidebar_width(panes.width, app.sidebar_width)
     };
-    let [sidebar, diff] =
-        Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(panes);
+    let [sidebar, diff] = if app.sidebar_right {
+        let [diff, sidebar] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(width)]).areas(panes);
+        [sidebar, diff]
+    } else {
+        Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(panes)
+    };
+    menu::draw_bar(frame, app, bar);
     footer(frame, app, bottom);
     sidebar::draw(frame, app, sidebar);
     diff::draw(frame, app, diff);
     find::draw(frame, app);
     palette::draw(frame, app);
+    menu::draw_dropdown(frame, app);
 }
 
 /// ` ◧ files   ZDIFF  master · HEAD → worktree` on the left, the change totals on the right.
 fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
-    let (icon, color) = if app.sidebar_hidden {
-        ("◫", DIM)
-    } else {
-        ("◧", ACCENT)
+    let c = app.shown_theme().colors();
+    let (icon, color) = match (app.sidebar_hidden, app.sidebar_right) {
+        (true, _) => ("◫", c.dim),
+        (false, true) => ("◨", c.accent),
+        (false, false) => ("◧", c.accent),
     };
     let toggle = Span::from(format!(" {icon} files ")).fg(color);
     app.sidebar_toggle = Rect {
@@ -80,17 +75,27 @@ fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
         toggle,
         " ".into(),
         format!(" {} ", app.repo_name.to_uppercase())
-            .fg(Color::Black)
-            .bg(BADGE_BG)
+            .fg(c.badge_fg)
+            .bg(c.badge)
             .bold(),
-        format!(" {} · {}", app.branch, app.compare).fg(DIM),
+        format!(" {} · {}", app.branch, app.compare).fg(c.dim),
+        if app.read_only { " · read-only" } else { "" }.fg(c.dim),
     ];
     // ponytail: totals summed per draw, O(files); cache them in `refresh` at 10k+ changed files.
     let (files, added, removed) = (app.tree.files()).fold((0, 0, 0), |(n, a, r), (_, e)| {
         (n + 1, a + e.added, r + e.removed)
     });
-    let mut right = vec![format!("{files} files ").fg(DIM)];
-    right.extend(counts(added, removed));
+    let right = if let Some(notice) = &app.notice {
+        let (text, color) = match notice {
+            Notice::Error(text) => (text, c.red),
+            Notice::Done(text) => (text, c.green),
+        };
+        vec![format!("{text} ").fg(color)]
+    } else {
+        let mut right = vec![format!("{files} files ").fg(c.dim)];
+        right.extend(counts(c, added, removed));
+        right
+    };
     frame.render_widget(right_aligned(left, right, area.width), area);
 }
 
@@ -102,29 +107,25 @@ fn sidebar_width(total: u16, dragged: Option<u16>) -> u16 {
         .clamp(SIDEBAR_MIN, (total / 2).max(SIDEBAR_MIN))
 }
 
+/// A popup's bordered box; sets text color too, since `Clear` under it wipes the base one.
+fn popup(c: &Colors) -> Block<'static> {
+    Block::bordered()
+        .border_style(Style::new().fg(c.dim))
+        .fg(c.fg)
+        .bg(c.modal)
+}
+
 /// `text` in its look: syntax color, then the search or changed-word background.
-fn styled(text: String, look: Look, emph_bg: Color) -> Span<'static> {
+fn styled(c: &Colors, text: String, look: Look, emph_bg: Color) -> Span<'static> {
     let span = match look.class {
-        Some(class) => text.fg(class_color(class)),
+        Some(class) => text.fg(c.class(class)),
         None => text.into(),
     };
     match (look.found, look.emph) {
-        (Found::Current, _) => span.bg(FIND_CURRENT_BG),
-        (Found::Match, _) => span.bg(FIND_BG),
+        (Found::Current, _) => span.bg(c.find_current),
+        (Found::Match, _) => span.bg(c.find),
         (Found::No, true) => span.bg(emph_bg),
         (Found::No, false) => span,
-    }
-}
-
-/// GitHub's dark syntax palette (Primer `prettylights.syntax.*`).
-fn class_color(class: Class) -> Color {
-    match class {
-        Class::Keyword => Color::Rgb(0xff, 0x7b, 0x72),
-        Class::String => Color::Rgb(0xa5, 0xd6, 0xff),
-        Class::Constant => Color::Rgb(0x79, 0xc0, 0xff),
-        Class::Entity => Color::Rgb(0xd2, 0xa8, 0xff),
-        Class::Tag => Color::Rgb(0x7e, 0xe7, 0x87),
-        Class::Comment => Color::Rgb(0x91, 0x98, 0xa1),
     }
 }
 
@@ -138,20 +139,20 @@ fn right_aligned<'a>(mut spans: Vec<Span<'a>>, counts: Vec<Span<'a>>, width: u16
 }
 
 /// `+N -M` in green and red; zero counts are left out.
-fn counts(added: u32, removed: u32) -> Vec<Span<'static>> {
+fn counts(c: &Colors, added: u32, removed: u32) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(2);
     if added > 0 {
-        spans.push(format!("+{added}").fg(GREEN));
+        spans.push(format!("+{added}").fg(c.green));
     }
     if removed > 0 {
-        spans.push(format!(" -{removed}").fg(RED));
+        spans.push(format!(" -{removed}").fg(c.red));
     }
     spans
 }
 
 /// Renders `app` into a `width` x `height` test terminal, one string per screen row.
 #[cfg(test)]
-fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+pub(crate) fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Cell;
@@ -163,6 +164,8 @@ fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
         .buffer()
         .content()
         .chunks(usize::from(width))
+        // The menu bar row is covered by its own test; callers see the panes and footer.
+        .skip(1)
         .map(|row| row.iter().map(Cell::symbol).collect())
         .collect()
 }
@@ -184,6 +187,7 @@ mod tests {
             added,
             removed,
             change: 0,
+            staged: zdiff_core::Staged::No,
         };
         let mut app = App::new(vec![entry("a.rs", 2, 1), entry("b/c.rs", 1, 0)]);
         app.repo_name = "zdiff".into();
@@ -199,17 +203,50 @@ mod tests {
             "{footer:?}"
         );
         assert!(footer.trim_end().ends_with("2 files +3 -1"), "{footer:?}");
-        assert_eq!(buffer[(11, 5)].bg, BADGE_BG);
+        assert!(!footer.contains("read-only"));
+        assert_eq!(buffer[(11, 5)].bg, DARK.badge);
         assert_eq!(app.sidebar_toggle, Rect::new(0, 5, 9, 1));
-        assert!(row(0).contains('│'), "divider shown");
+        assert!(row(1).contains('│'), "divider shown");
 
         app.sidebar_hidden = true;
         terminal.draw(|f| draw(f, &mut app)).expect("draw");
         let buffer = terminal.backend().buffer();
         let row = |y: u16| -> String { (0..80).map(|x| buffer[(x, y)].symbol()).collect() };
         assert!(row(5).starts_with(" ◫ files "), "{:?}", row(5));
-        assert!(!row(0).contains('│'), "no divider: {:?}", row(0));
+        assert!(!row(1).contains('│'), "no divider: {:?}", row(1));
         assert_eq!(app.sidebar.width, 0);
+
+        (app.sidebar_hidden, app.sidebar_right) = (false, true);
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..80).map(|x| buffer[(x, 5)].symbol()).collect();
+        assert!(footer.starts_with(" ◨ files "), "{footer:?}");
+
+        app.notice = Some(Notice::Error("settings: unknown action \"nope\"".into()));
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..80).map(|x| buffer[(x, 5)].symbol()).collect();
+        let x = footer
+            .find("settings:")
+            .expect("the notice replaces the totals");
+        let x = u16::try_from(footer[..x].chars().count()).unwrap();
+        assert_eq!(buffer[(x, 5)].fg, DARK.red);
+
+        app.notice = Some(Notice::Done("committed abc1234".into()));
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..80).map(|x| buffer[(x, 5)].symbol()).collect();
+        let x = footer
+            .find("committed")
+            .expect("the notice replaces the totals");
+        let x = u16::try_from(footer[..x].chars().count()).unwrap();
+        assert_eq!(buffer[(x, 5)].fg, DARK.green, "a success is green");
+
+        (app.notice, app.read_only) = (None, true);
+        terminal.draw(|f| draw(f, &mut app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let footer: String = (0..80).map(|x| buffer[(x, 5)].symbol()).collect();
+        assert!(footer.contains("HEAD → worktree · read-only"), "{footer:?}");
     }
 
     #[test]

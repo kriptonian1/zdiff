@@ -4,22 +4,20 @@ use std::mem;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 use zdiff_core::Side;
 
 use zdiff_search::MAX_HITS;
 
 use super::find::{TOGGLES_WIDTH, toggle_spans};
-use super::{
-    ACCENT, BADGE_BG, DIM, GREEN, MODAL_BG, RED, SELECTED_BG, counts, right_aligned,
-    sidebar::status_color, styled,
-};
+use super::{Colors, counts, popup, right_aligned, styled};
 use crate::app::{App, DiffPane, FileEntry};
-use crate::palette::{self, Files, Hit, Input, Mode, Search};
+use crate::palette::{self, Capture, Files, Hit, Input, Keys, Mode, Search, Themes};
 use crate::text::{self, Marks};
 use crate::tree::Tree;
+use crate::ui::Theme;
 
 /// Go-to-line box: border, input, rule, footer, border.
 const LINE_SIZE: (u16, u16) = (60, 5);
@@ -27,10 +25,18 @@ const LINE_SIZE: (u16, u16) = (60, 5);
 const FILE_SIZE: (u16, u16) = (70, 16);
 /// Global search box: three fields and about eighteen result rows.
 const SEARCH_SIZE: (u16, u16) = (90, 26);
+/// Shortcuts box: room for about fifteen rows.
+const KEYS_SIZE: (u16, u16) = (84, 20);
+/// Theme picker: room for about fifteen themes.
+const THEMES_SIZE: (u16, u16) = (50, 20);
+/// Columns for an action's label and its keys on the shortcuts screen.
+const KEY_LABEL_WIDTH: usize = 34;
+const KEY_KEYS_WIDTH: usize = 22;
 /// Global search field badges, padded to one width so the inputs line up.
 const BADGES: [&str; 3] = [" SEARCH  ", " include ", " exclude "];
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
+    let (c, current) = (app.shown_theme().colors(), app.theme);
     let Some(palette) = &mut app.palette else {
         return;
     };
@@ -38,6 +44,8 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::Line => (LINE_SIZE, " LINE ", " :"),
         Mode::File(_) => (FILE_SIZE, " FILE ", " "),
         Mode::Search(_) => (SEARCH_SIZE, "", ""),
+        Mode::Keys(_) => (KEYS_SIZE, " KEYS ", " "),
+        Mode::Themes(_) => (THEMES_SIZE, " THEME ", " "),
     };
     let area = frame.area();
     let width = width.min(area.width.saturating_sub(4));
@@ -50,9 +58,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     };
     app.palette_area = modal;
 
-    let block = Block::bordered()
-        .border_style(Style::new().fg(DIM))
-        .bg(MODAL_BG);
+    let block = popup(c);
     let inner = block.inner(modal);
     frame.render_widget(Clear, modal);
     frame.render_widget(block, modal);
@@ -69,26 +75,23 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(inner);
     frame.render_widget(
-        Line::from("─".repeat(usize::from(rule.width))).fg(DIM),
+        Line::from("─".repeat(usize::from(rule.width))).fg(c.dim),
         rule,
     );
     if let Mode::Search(search) = &mut palette.mode {
-        draw_search(frame, search, &app.tree, [prompt, list, footer]);
+        draw_search(frame, c, search, &app.tree, [prompt, list, footer]);
         return;
     }
 
-    let input = palette.input.as_str();
-    frame.render_widget(
-        Line::from(vec![
-            badge.fg(Color::Black).bg(BADGE_BG).bold(),
-            sep.into(),
-            input.into(),
-        ]),
-        prompt,
-    );
-    // Badge, separator, and input are ASCII, so bytes are columns.
-    let typed = u16::try_from(badge.len() + sep.len() + input.len()).unwrap_or(u16::MAX);
-    frame.set_cursor_position((prompt.x.saturating_add(typed), prompt.y));
+    // Badge and separator are ASCII, so bytes are columns.
+    let label = u16::try_from(badge.len() + sep.len()).unwrap_or(u16::MAX);
+    let [label_area, text] =
+        Layout::horizontal([Constraint::Length(label), Constraint::Fill(1)]).areas(prompt);
+    let prompt_line = Line::from(vec![badge.fg(c.badge_fg).bg(c.badge).bold(), sep.into()]);
+    frame.render_widget(prompt_line, label_area);
+    palette.field.draw(frame, text, c, true);
+    let input = palette.field.text();
+    let input = input.as_str();
 
     let status = match &mut palette.mode {
         Mode::Line => {
@@ -99,18 +102,30 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             hint(input, old, new)
         }
         Mode::File(files) => {
-            draw_hits(frame, files, &app.tree, list);
+            draw_hits(frame, c, files, &app.tree, list);
             let total = app.tree.files().count();
             format!("{} of {total} files · ↑↓ move · ⏎ open", files.hits.len())
         }
         Mode::Search(_) => unreachable!("drawn by draw_search"),
+        Mode::Keys(keys) => {
+            draw_keys(frame, c, keys, list);
+            keys_status(keys)
+        }
+        Mode::Themes(themes) => {
+            draw_themes(frame, c, themes, current, list);
+            format!(
+                "{} themes · ↑↓ preview · ⏎ apply · Esc close",
+                themes.shown.len()
+            )
+        }
     };
-    frame.render_widget(Line::from(format!(" {status}")).fg(DIM), footer);
+    frame.render_widget(Line::from(format!(" {status}")).fg(c.dim), footer);
 }
 
 /// Global search: three fields, the toggles, streamed results grouped by file, and a status footer.
 fn draw_search(
     frame: &mut Frame,
+    c: &Colors,
     search: &mut Search,
     tree: &Tree,
     [prompt, list, footer]: [Rect; 3],
@@ -121,8 +136,9 @@ fn draw_search(
     let [first, right] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(right_width)]).areas(rows[0]);
     let x = right.x + right_width - TOGGLES_WIDTH;
-    let mut spans = vec![Span::from(count).fg(DIM)];
+    let mut spans = vec![Span::from(count).fg(c.dim)];
     spans.extend(toggle_spans(
+        c,
         &search.query,
         x,
         right.y,
@@ -132,34 +148,27 @@ fn draw_search(
 
     let areas = [first, rows[1], rows[2]];
     search.field_areas = areas;
-    for ((badge, input), area) in BADGES.into_iter().zip(Input::ALL).zip(areas) {
-        let text = match input {
-            Input::Query => &search.query.text,
-            Input::Include => &search.include,
-            Input::Exclude => &search.exclude,
-        };
+    let fields = BADGES.into_iter().zip(Input::ALL).zip(&mut search.fields);
+    for (((badge, input), field), area) in fields.zip(areas) {
         let active = search.input == input;
-        let badge_bg = if active { BADGE_BG } else { SELECTED_BG };
+        let (fg, bg) = if active {
+            (c.badge_fg, c.badge)
+        } else {
+            (c.dim, c.selected)
+        };
+        let label = u16::try_from(badge.len() + 1).unwrap_or(u16::MAX);
+        let [label_area, text] =
+            Layout::horizontal([Constraint::Length(label), Constraint::Fill(1)]).areas(area);
         frame.render_widget(
-            Line::from(vec![
-                badge.fg(Color::Black).bg(badge_bg).bold(),
-                " ".into(),
-                text.as_str().into(),
-            ]),
-            area,
+            Line::from(vec![badge.fg(fg).bg(bg).bold(), " ".into()]),
+            label_area,
         );
-        if active {
-            let typed = badge.len() + 1 + text.chars().count();
-            let x = area
-                .x
-                .saturating_add(u16::try_from(typed).unwrap_or(u16::MAX));
-            frame.set_cursor_position((x.min(area.right()), area.y));
-        }
+        field.draw(frame, text, c, active);
     }
 
-    draw_results(frame, search, tree, list);
+    draw_results(frame, c, search, tree, list);
     let status = if let Some(error) = search.error {
-        Line::from(format!(" {error}")).fg(RED)
+        Line::from(format!(" {error}")).fg(c.red)
     } else {
         let plus = if search.hits == MAX_HITS { "+" } else { "" };
         let state = if search.done { "done" } else { "searching…" };
@@ -169,13 +178,13 @@ fn draw_search(
             search.groups.len(),
             search.filtered_out
         );
-        Line::from(text).fg(DIM)
+        Line::from(text).fg(c.dim)
     };
     frame.render_widget(status, footer);
 }
 
 /// The visible slice of search results, scrolled to keep the selection in view.
-fn draw_results(frame: &mut Frame, search: &mut Search, tree: &Tree, area: Rect) {
+fn draw_results(frame: &mut Frame, c: &Colors, search: &mut Search, tree: &Tree, area: Rect) {
     search.list_area = area;
     if search.rows.is_empty() {
         let text = if search.query.text.is_empty() {
@@ -185,7 +194,7 @@ fn draw_results(frame: &mut Frame, search: &mut Search, tree: &Tree, area: Rect)
         } else {
             ""
         };
-        frame.render_widget(Paragraph::new(text).fg(DIM), area);
+        frame.render_widget(Paragraph::new(text).fg(c.dim), area);
         return;
     }
     let height = usize::from(area.height).max(1);
@@ -197,7 +206,7 @@ fn draw_results(frame: &mut Frame, search: &mut Search, tree: &Tree, area: Rect)
     *search.list.offset_mut() = offset;
     let end = (offset + height).min(search.rows.len());
     for (y, row) in (area.y..).zip(offset..end) {
-        let line = result_row(search, tree, row, selected == Some(row), area.width);
+        let line = result_row(c, search, tree, row, selected == Some(row), area.width);
         let rect = Rect {
             y,
             height: 1,
@@ -208,6 +217,7 @@ fn draw_results(frame: &mut Frame, search: &mut Search, tree: &Tree, area: Rect)
 }
 
 fn result_row(
+    c: &Colors,
     search: &Search,
     tree: &Tree,
     row: usize,
@@ -223,24 +233,24 @@ fn result_row(
         let spans = vec![" ".into(), Span::from(path).bold()];
         return right_aligned(
             spans,
-            vec![Span::from(group.hits.len().to_string()).fg(DIM)],
+            vec![Span::from(group.hits.len().to_string()).fg(c.dim)],
             width,
         );
     };
     let marker = match (hit.changed, hit.side) {
         (false, _) => " ".into(),
-        (true, zdiff_core::Side::Old) => "-".fg(RED),
-        (true, zdiff_core::Side::New) => "+".fg(GREEN),
+        (true, zdiff_core::Side::Old) => "-".fg(c.red),
+        (true, zdiff_core::Side::New) => "+".fg(c.green),
     };
     let mut spans = vec![
         if selected {
-            "▌".fg(ACCENT)
+            "▌".fg(c.accent)
         } else {
             " ".into()
         },
         "  ".into(),
         marker,
-        format!(" {:>5}  ", hit.line + 1).fg(DIM),
+        format!(" {:>5}  ", hit.line + 1).fg(c.dim),
     ];
     let used: usize = spans.iter().map(Span::width).sum();
     let found = u32::from(hit.range.start)..u32::from(hit.range.end);
@@ -251,28 +261,93 @@ fn result_row(
     };
     let take = usize::from(width).saturating_sub(used + 1);
     let segments = text::segments(&hit.snippet, 0, marks, 0, take);
-    spans.extend((segments.into_iter()).map(|(text, look)| styled(text, look, Color::Reset)));
+    spans.extend((segments.into_iter()).map(|(text, look)| styled(c, text, look, c.bg)));
     let line = Line::from(spans);
-    if selected { line.bg(SELECTED_BG) } else { line }
+    if selected { line.bg(c.selected) } else { line }
 }
 
 /// Ranked results: status, name, and dim folder with matched chars highlighted, counts on the right.
-fn draw_hits(frame: &mut Frame, files: &mut Files, tree: &Tree, area: Rect) {
+/// The shortcuts footer: the rebinding prompt, or the count and what the keys do.
+fn keys_status(keys: &Keys) -> String {
+    match keys.capture {
+        Some(Capture {
+            taken: Some((key, holder)),
+            ..
+        }) => format!(
+            "{key} is \"{}\" · Enter take it · Esc cancel",
+            holder.label()
+        ),
+        Some(capture) => format!(
+            "press a key for \"{}\" · Esc cancel",
+            capture.action.label()
+        ),
+        None => format!(
+            "{} shortcuts · ⏎ change · ⇧⏎ add a key · Del reset · Esc close",
+            keys.shown.len()
+        ),
+    }
+}
+
+/// The shortcuts screen: action, its keys, and where they work; fixed keys get a lock.
+fn draw_keys(frame: &mut Frame, c: &Colors, keys: &mut Keys, area: Rect) {
+    keys.area = area;
+    if keys.shown.is_empty() {
+        frame.render_widget(Paragraph::new(" No matches").fg(c.dim), area);
+        return;
+    }
+    let rows: Vec<ListItem> = (keys.shown.iter())
+        .map(|&i| {
+            let row = &keys.rows[i];
+            let mark = match (row.action, row.edited) {
+                (None, _) => " 🔒",
+                (Some(_), true) => " ✎",
+                (Some(_), false) => "",
+            };
+            ListItem::new(Line::from(vec![
+                format!(" {:<KEY_LABEL_WIDTH$} ", row.label).into(),
+                format!("{:<KEY_KEYS_WIDTH$} ", row.keys).fg(c.accent),
+                row.place.fg(c.dim),
+                mark.into(),
+            ]))
+        })
+        .collect();
+    let list = List::new(rows).highlight_style(Style::new().bg(c.selected));
+    frame.render_stateful_widget(list, area, &mut keys.list);
+}
+
+/// One row per theme, with a check on the one in use.
+fn draw_themes(frame: &mut Frame, c: &Colors, themes: &mut Themes, current: Theme, area: Rect) {
+    themes.area = area;
+    if themes.shown.is_empty() {
+        frame.render_widget(Paragraph::new(" No matches").fg(c.dim), area);
+        return;
+    }
+    let rows = themes.shown.iter().map(|&theme| {
+        let check = if theme == current { "✓" } else { " " };
+        ListItem::new(format!(" {check} {}", theme.label()))
+    });
+    let list = List::new(rows).highlight_style(Style::new().bg(c.selected));
+    frame.render_stateful_widget(list, area, &mut themes.list);
+}
+
+fn draw_hits(frame: &mut Frame, c: &Colors, files: &mut Files, tree: &Tree, area: Rect) {
     files.area = area;
     if files.hits.is_empty() {
-        frame.render_widget(Paragraph::new(" No matches").fg(DIM), area);
+        frame.render_widget(Paragraph::new(" No matches").fg(c.dim), area);
         return;
     }
     let selected = files.list.selected();
     let rows: Vec<ListItem> = (files.hits.iter().enumerate())
         .filter_map(|(i, hit)| Some((i, hit, tree.file(hit.node)?)))
-        .map(|(i, hit, entry)| ListItem::new(hit_row(hit, entry, selected == Some(i), area.width)))
+        .map(|(i, hit, entry)| {
+            ListItem::new(hit_row(c, hit, entry, selected == Some(i), area.width))
+        })
         .collect();
-    let list = List::new(rows).highlight_style(Style::new().bg(SELECTED_BG));
+    let list = List::new(rows).highlight_style(Style::new().bg(c.selected));
     frame.render_stateful_widget(list, area, &mut files.list);
 }
 
-fn hit_row(hit: &Hit, entry: &FileEntry, selected: bool, width: u16) -> Line<'static> {
+fn hit_row(c: &Colors, hit: &Hit, entry: &FileEntry, selected: bool, width: u16) -> Line<'static> {
     let path = entry.path.to_string_lossy();
     let (dir, name) = path.rsplit_once('/').unwrap_or(("", &path));
     // Match positions count chars across the whole path; the name starts after `dir/`.
@@ -283,22 +358,22 @@ fn hit_row(hit: &Hit, entry: &FileEntry, selected: bool, width: u16) -> Line<'st
     };
     let mut spans = vec![
         if selected {
-            "▌".fg(ACCENT)
+            "▌".fg(c.accent)
         } else {
             " ".into()
         },
-        entry.status.as_str().fg(status_color(entry.status)),
+        entry.status.as_str().fg(c.status(entry.status)),
         " ".into(),
     ];
-    spans.extend(marked(name, name_base, &hit.chars, Style::new()));
+    let lit = Style::new().fg(c.accent).underlined();
+    spans.extend(marked(name, name_base, &hit.chars, (Style::new(), lit)));
     spans.push("  ".into());
-    spans.extend(marked(dir, 0, &hit.chars, Style::new().fg(DIM)));
-    right_aligned(spans, counts(entry.added, entry.removed), width)
+    spans.extend(marked(dir, 0, &hit.chars, (Style::new().fg(c.dim), lit)));
+    right_aligned(spans, counts(c, entry.added, entry.removed), width)
 }
 
-/// `text` as spans in `style`, with chars whose position (from `base`) is in `hits` in ACCENT.
-fn marked(text: &str, base: u32, hits: &[u32], style: Style) -> Vec<Span<'static>> {
-    let lit = style.fg(ACCENT).underlined();
+/// `text` as spans in `style`, with chars whose position (from `base`) is in `hits` in `lit`.
+fn marked(text: &str, base: u32, hits: &[u32], (style, lit): (Style, Style)) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut run = String::new();
     let mut run_lit = false;
@@ -343,6 +418,7 @@ mod tests {
 
     use super::*;
     use crate::app::FileEntry;
+    use crate::ui::DARK;
 
     #[test]
     fn hint_says_where_enter_goes() {
@@ -365,6 +441,7 @@ mod tests {
             added: 1,
             removed: 1,
             change: 0,
+            staged: zdiff_core::Staged::No,
         }]);
         app.show(Some(Ok(FileDiff::new(
             b"a\nb\n".to_vec(),
@@ -377,7 +454,7 @@ mod tests {
         let before = terminal.backend().buffer().clone();
 
         app.palette = Some(crate::palette::Palette::line());
-        app.palette.as_mut().unwrap().input.push('2');
+        app.palette.as_mut().unwrap().field = crate::input::Field::single("2");
         terminal
             .draw(|f| crate::ui::draw(f, &mut app))
             .expect("draw");
@@ -406,10 +483,11 @@ mod tests {
             added: 3,
             removed: 1,
             change: 0,
+            staged: zdiff_core::Staged::No,
         });
         let mut app = App::new(files.collect());
         let mut palette = crate::palette::Palette::files(&app.tree);
-        palette.input = input.into();
+        palette.field = crate::input::Field::single(input);
         if let Mode::File(files) = &mut palette.mode {
             files.update(input, &app.tree);
         }
@@ -437,7 +515,7 @@ mod tests {
         // First name char `r` is a match.
         let r = row(3).chars().position(|c| c == 'r').expect("name");
         let x = u16::try_from(r).unwrap();
-        assert_eq!(buffer[(x, modal.y + 3)].fg, ACCENT);
+        assert_eq!(buffer[(x, modal.y + 3)].fg, DARK.accent);
     }
 
     #[test]
@@ -460,12 +538,13 @@ mod tests {
             added: 1,
             removed: 0,
             change: 0,
+            staged: zdiff_core::Staged::No,
         }]);
         let query = zdiff_search::Query {
             text: "need".into(),
             ..zdiff_search::Query::default()
         };
-        app.palette = Some(Palette::search(query, "src".into()));
+        app.palette = Some(Palette::search(query, "src"));
         let node = app.tree.files().next().map(|(n, _)| n).unwrap();
         if let Some(Palette {
             mode: Mode::Search(search),
@@ -506,10 +585,93 @@ mod tests {
         let hit = has("▌  +     1  let needle = 1;").expect("hit row");
         let y = u16::try_from(hit).unwrap();
         let n = (0..120).find(|&x| buffer[(x, y)].symbol() == "n").unwrap();
-        assert_eq!(buffer[(n, y)].bg, crate::ui::FIND_BG, "match highlighted");
+        assert_eq!(buffer[(n, y)].bg, DARK.find, "match highlighted");
         let l = (0..120).find(|&x| buffer[(x, y)].symbol() == "l").unwrap();
-        let keyword = crate::ui::class_color(zdiff_highlight::Class::Keyword);
+        let keyword = DARK.class(zdiff_highlight::Class::Keyword);
         assert_eq!(buffer[(l, y)].fg, keyword, "`let` syntax colored");
         assert!(has("1 hits in 1 files · 0 filtered out · searching…").is_some());
+    }
+
+    #[test]
+    fn shortcuts_screen_lists_actions_with_their_keys_and_place() {
+        let mut app = App::new(Vec::new());
+        app.palette = Some(crate::palette::Palette::keys(&app.keymap));
+        let screen = crate::ui::render(&mut app, 100, 30);
+        let row = (screen.iter())
+            .find(|row| row.contains("Sidebar ") && row.contains("Ctrl+B"))
+            .expect("a Sidebar row");
+        assert!(row.contains("everywhere"), "{row:?}");
+
+        app.keymap
+            .set(crate::menu::Action::NextFile, &["m".parse().unwrap()]);
+        app.palette = Some(crate::palette::Palette::keys(&app.keymap));
+        if let Some(crate::palette::Palette {
+            mode: Mode::Keys(keys),
+            ..
+        }) = &mut app.palette
+        {
+            let action = crate::menu::Action::NextFile;
+            keys.capture = Some(Capture {
+                action,
+                add: false,
+                taken: Some(("Ctrl+B".parse().unwrap(), crate::menu::Action::Sidebar)),
+            });
+        }
+        let rebinding = crate::ui::render(&mut app, 100, 30);
+        let edited = rebinding
+            .iter()
+            .find(|row| row.contains("Next file"))
+            .expect("row");
+        assert!(edited.contains(" m ") && edited.contains('✎'), "{edited:?}");
+        assert!(
+            (rebinding.iter()).any(|row| row.contains("Ctrl+B is \"Sidebar\" · Enter take it")),
+            "the taken prompt"
+        );
+        assert!(
+            screen
+                .iter()
+                .any(|row| row.contains("shortcuts · ⏎ change · ⇧⏎ add a key · Del reset"))
+        );
+    }
+
+    #[test]
+    fn inactive_search_badges_stay_readable_in_the_light_theme() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        use crate::palette::Palette;
+
+        let mut app = App::new(Vec::new());
+        app.theme = crate::ui::Theme::GithubLight;
+        app.palette = Some(Palette::search(zdiff_search::Query::default(), ""));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test backend");
+        terminal
+            .draw(|f| crate::ui::draw(f, &mut app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let c = app.theme.colors();
+        let Some(Palette {
+            mode: Mode::Search(search),
+            ..
+        }) = &app.palette
+        else {
+            panic!("search is open");
+        };
+        let [query, include, _] = search.field_areas;
+        let cell = |area: Rect| &buffer[(area.x + 1, area.y)];
+        assert_eq!((cell(query).fg, cell(query).bg), (c.badge_fg, c.badge));
+        assert_eq!(cell(include).symbol(), "i");
+        assert_eq!((cell(include).fg, cell(include).bg), (c.dim, c.selected));
+    }
+
+    #[test]
+    fn theme_picker_lists_every_theme_and_checks_the_current_one() {
+        let mut app = App::new(Vec::new());
+        app.theme = crate::ui::Theme::GithubLight;
+        app.palette = Some(crate::palette::Palette::themes(app.theme));
+        let screen = crate::ui::render(&mut app, 100, 30);
+        let find = |text: &str| screen.iter().find(|row| row.contains(text)).cloned();
+        assert!(find(" THEME ").is_some(), "{screen:#?}");
+        assert!(find("  GitHub Dark").is_some(), "{screen:#?}");
+        assert!(find("✓ GitHub Light").is_some(), "{screen:#?}");
     }
 }

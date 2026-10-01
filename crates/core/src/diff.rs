@@ -17,6 +17,9 @@ pub struct FileDiff {
     /// Empty when the file is binary or both sides are equal.
     pub hunks: Box<[Hunk]>,
     pub binary: bool,
+    /// Only these line ranges are real, one per patch hunk; the lines between them are empty
+    /// placeholders. `None` when both sides are whole files.
+    pub known: Option<Box<[Hunk]>>,
 }
 
 /// One changed region, as zero-based line index ranges into each side.
@@ -136,6 +139,30 @@ impl FileDiff {
             new: text(new),
             hunks,
             binary,
+            known: None,
+        }
+    }
+
+    /// A diff of two partial sides, such as a patch's hunks: `known` lists the real ranges and
+    /// every other line of `old` and `new` is an empty placeholder; `hunks` lie inside `known`.
+    pub(crate) fn partial(old: Vec<u8>, new: Vec<u8>, hunks: Vec<Hunk>, known: Vec<Hunk>) -> Self {
+        Self {
+            old: Text::indexed(old),
+            new: Text::indexed(new),
+            hunks: hunks.into(),
+            binary: false,
+            known: Some(known.into()),
+        }
+    }
+
+    /// A binary file known only by name, such as one in a patch.
+    pub(crate) fn binary() -> Self {
+        Self {
+            old: Text::default(),
+            new: Text::default(),
+            hunks: Box::default(),
+            binary: true,
+            known: None,
         }
     }
 

@@ -2,10 +2,11 @@
 
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use zdiff_core::{Change, Repo, Side};
+use zdiff_core::{Change, FileDiff, Patch, Repo, Side};
 use zdiff_highlight::Token;
 use zdiff_search::{Finder, MAX_HITS};
 
@@ -16,11 +17,42 @@ const LEAD: usize = 40;
 /// Longest snippet in bytes; the result row shows as much as fits.
 const SNIPPET: usize = 160;
 
-/// One search over `changes`, as `(index into the snapshot's changes, change)`.
+/// One search over some files.
 pub struct Job {
     pub generation: u64,
     pub finder: Finder,
-    pub changes: Vec<(usize, Change)>,
+    pub items: Items,
+}
+
+/// The files a job searches, each with its index into the app's file list.
+pub enum Items {
+    /// Repository changes, loaded through the worker's own repo.
+    Changes(Vec<(usize, Change)>),
+    /// Files of an already parsed patch.
+    Patch(Arc<Patch>, Vec<usize>),
+}
+
+impl Items {
+    fn len(&self) -> usize {
+        match self {
+            Self::Changes(changes) => changes.len(),
+            Self::Patch(_, files) => files.len(),
+        }
+    }
+
+    /// Item `k`'s index, path, and diff; `None` when it can't be loaded, like a vanished file.
+    fn load(&self, k: usize, repo: Option<&Repo>) -> Option<(usize, &Path, FileDiff)> {
+        match self {
+            Self::Changes(changes) => {
+                let (index, change) = &changes[k];
+                Some((*index, &change.path, repo?.diff(change).ok()?))
+            }
+            Self::Patch(patch, files) => {
+                let i = files[k];
+                Some((i, &patch.files().get(i)?.path, patch.full_diff(i, repo)))
+            }
+        }
+    }
 }
 
 /// A hit plus a trimmed piece of its line; whole files never leave the worker.
@@ -36,31 +68,32 @@ pub struct Found {
     pub tokens: Box<[Token]>,
 }
 
-/// Starts the worker with its own repo; send it [`Job`]s, a newer job replaces a running one.
-pub fn spawn(workdir: &Path, tx: Sender<Msg>) -> anyhow::Result<Sender<Job>> {
-    let repo = Repo::discover(workdir)?;
+/// Starts the worker, with its own repo when given a `workdir`; send it [`Job`]s, and a newer
+/// job replaces a running one.
+pub fn spawn(workdir: Option<&Path>, tx: Sender<Msg>) -> anyhow::Result<Sender<Job>> {
+    let repo = workdir.map(Repo::discover).transpose()?;
     let (jobs_tx, jobs) = mpsc::channel();
     thread::spawn(move || {
         let mut next = None;
         while let Some(job) = next.take().or_else(|| jobs.recv().ok()) {
-            next = run(&repo, &job, &jobs, &tx);
+            next = run(repo.as_ref(), &job, &jobs, &tx);
         }
     });
     Ok(jobs_tx)
 }
 
 /// Runs `job`, returning a newer job that arrived meanwhile; stops early if the UI is gone.
-fn run(repo: &Repo, job: &Job, jobs: &Receiver<Job>, tx: &Sender<Msg>) -> Option<Job> {
+fn run(repo: Option<&Repo>, job: &Job, jobs: &Receiver<Job>, tx: &Sender<Msg>) -> Option<Job> {
     let mut total = 0;
-    for (index, change) in &job.changes {
+    for k in 0..job.items.len() {
         if let Some(newer) = jobs.try_iter().last() {
             return Some(newer);
         }
         // A file that vanished or can't be read is skipped, like git grep.
-        let Ok(diff) = repo.diff(change) else {
+        let Some((index, path, diff)) = job.items.load(k, repo) else {
             continue;
         };
-        let language = zdiff_highlight::language(&change.path);
+        let language = zdiff_highlight::language(path);
         // Each side is highlighted once, on its first hit, with whole-file context.
         // ponytail: whole file per side even for one hit; highlight a window if huge files lag.
         let mut sides: [Option<Box<[Token]>>; 2] = [None, None];
@@ -93,7 +126,7 @@ fn run(repo: &Repo, job: &Job, jobs: &Receiver<Job>, tx: &Sender<Msg>) -> Option
         total += hits.len();
         let found = Msg::Found {
             generation: job.generation,
-            change: *index,
+            change: index,
             hits,
         };
         if tx.send(found).is_err() {
@@ -228,7 +261,7 @@ mod tests {
         Job {
             generation,
             finder: query.compile().expect("valid"),
-            changes: changes.into_iter().enumerate().collect(),
+            items: Items::Changes(changes.into_iter().enumerate().collect()),
         }
     }
 
@@ -247,7 +280,7 @@ mod tests {
 
         let repo = Repo::discover(dir.path()).expect("repo");
         let (tx, rx) = mpsc::channel();
-        let jobs = spawn(dir.path(), tx).expect("worker");
+        let jobs = spawn(Some(dir.path()), tx).expect("worker");
         jobs.send(job(&repo, 7, "needle")).unwrap();
         let recv = || rx.recv_timeout(Duration::from_secs(5)).expect("message");
         let Msg::Found {
@@ -281,7 +314,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (queue, pending) = mpsc::channel();
         queue.send(job(&repo, 9, "hay")).unwrap();
-        let newer = run(&repo, &job(&repo, 8, "needle"), &pending, &tx);
+        let newer = run(Some(&repo), &job(&repo, 8, "needle"), &pending, &tx);
         assert_eq!(newer.map(|j| j.generation), Some(9));
         assert!(rx.try_recv().is_err(), "the replaced job sent nothing");
     }

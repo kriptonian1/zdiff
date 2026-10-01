@@ -10,7 +10,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use zdiff_core::{Repo, Spec};
 
 use crate::Msg;
-use crate::snapshot::{Snapshot, Touched};
+use crate::snapshot::{Only, Snapshot, Touched};
 
 /// Quiet time that ends a batch; editors write a file several times per save.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -24,10 +24,17 @@ enum Touch {
     Path(PathBuf),
 }
 
-/// Starts watching `workdir`; each batch of edits sends a fresh [`Snapshot`] to `tx`.
+/// Starts watching `workdir`; each batch of edits to files `only` keeps sends a fresh
+/// [`Snapshot`] to `tx`.
 ///
 /// Setup happens before returning so watcher errors surface before the TUI starts.
-pub fn spawn(workdir: &Path, spec: Spec, first: Snapshot, tx: Sender<Msg>) -> anyhow::Result<()> {
+pub fn spawn(
+    workdir: &Path,
+    spec: Spec,
+    first: Snapshot,
+    only: Only,
+    tx: Sender<Msg>,
+) -> anyhow::Result<()> {
     // Event paths are canonical (e.g. /private/var on macOS); match them against a canonical root.
     let root = workdir.canonicalize()?;
     let (events_tx, events) = mpsc::channel();
@@ -40,8 +47,12 @@ pub fn spawn(workdir: &Path, spec: Spec, first: Snapshot, tx: Sender<Msg>) -> an
         let _watcher = watcher;
         let mut previous = first;
         while let Some(touched) = collect(&events, &root) {
+            if !only.touches(&touched) {
+                continue;
+            }
             // Index locked or mid-rebase: skip this batch, the next event retries.
-            let Ok(snapshot) = Snapshot::load(&repo, &spec, Some(&previous), &touched) else {
+            let Ok(snapshot) = Snapshot::load(&repo, &spec, Some(&previous), &touched, &only)
+            else {
                 continue;
             };
             // ponytail: snapshot cloned for the UI (paths + counts); share via Arc if repos get huge.
@@ -182,9 +193,10 @@ mod tests {
         assert!(init.success());
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         let repo = Repo::discover(dir.path()).unwrap();
-        let first = Snapshot::load(&repo, &Spec::default(), None, &Touched::All).unwrap();
+        let only = Only::default();
+        let first = Snapshot::load(&repo, &Spec::default(), None, &Touched::All, &only).unwrap();
         let (tx, rx) = mpsc::channel();
-        spawn(repo.workdir(), Spec::default(), first, tx).unwrap();
+        spawn(repo.workdir(), Spec::default(), first, only, tx).unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

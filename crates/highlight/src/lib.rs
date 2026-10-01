@@ -137,6 +137,7 @@ mod tests {
             ("a.py", "def f(): return 1"),
             ("a.go", "package main\nfunc f() int { return 1 }"),
             ("a.sh", "echo \"hi\" # c"),
+            ("a.svg", "<svg width=\"4\"><rect/></svg>"),
         ];
         for (file, source) in samples {
             assert_well_formed(file, source);
@@ -171,6 +172,18 @@ mod tests {
         let tsx = "const a: Props = <span />;";
         assert_eq!(role("a.tsx", tsx, "Props"), Some(Class::Entity));
         assert_eq!(role("a.tsx", tsx, "span"), Some(Class::Tag));
+    }
+
+    #[test]
+    fn svg_and_xml_follow_github_roles() {
+        let svg = "<?xml version=\"1.0\"?>\n<!-- c -->\n<svg width=\"4\"><rect/>hi</svg>";
+        assert_eq!(role("a.svg", svg, "svg w"), Some(Class::Tag));
+        assert_eq!(role("a.svg", svg, "rect"), Some(Class::Tag));
+        assert_eq!(role("a.svg", svg, "width"), Some(Class::Entity));
+        assert_eq!(role("a.svg", svg, "\"4\""), Some(Class::String));
+        assert_eq!(role("a.svg", svg, "<!-- c -->"), Some(Class::Comment));
+        assert_eq!(role("a.svg", svg, "hi"), None, "text stays default");
+        assert_eq!(role("a.xml", svg, "rect"), Some(Class::Tag));
     }
 
     #[test]

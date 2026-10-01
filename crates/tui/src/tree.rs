@@ -163,6 +163,19 @@ impl Tree {
         }
     }
 
+    /// The file at `row`, or every file under the folder at `row`, closed folders included.
+    pub fn files_in(&self, row: usize) -> impl Iterator<Item = &FileEntry> {
+        let range = match self.index(row).map(|i| (i, &self.nodes[i])) {
+            Some((i, Node::Dir { end, .. })) => i + 1..*end,
+            Some((i, Node::File { .. })) => i..i + 1,
+            None => 0..0,
+        };
+        self.nodes[range].iter().filter_map(|n| match n {
+            Node::File { entry, .. } => Some(entry),
+            Node::Dir { .. } => None,
+        })
+    }
+
     /// Every file with its node index, including files inside closed folders.
     pub fn files(&self) -> impl Iterator<Item = (usize, &FileEntry)> {
         self.nodes.iter().enumerate().filter_map(|(i, n)| match n {
@@ -254,6 +267,7 @@ mod tests {
             added: 2,
             removed: 1,
             change: 0,
+            staged: zdiff_core::Staged::No,
         }
     }
 

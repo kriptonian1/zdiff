@@ -41,7 +41,7 @@ Intended data flow:
 1. **repo** — discover/open the repository, resolve revisions.
 2. **changes** — list changed paths and their status (added/modified/deleted/renamed) for the chosen mode: unstaged (index vs worktree), staged (HEAD vs index), vs HEAD, or a rev range (tree vs tree).
 3. **content** — load old/new bytes per file (object DB blob or worktree file), detect binary.
-4. **diff** — line diff of the two versions via `gix::diff::blob` (imara-diff) → hunks. `memchr` for line splitting. No unified-diff text is generated or parsed.
+4. **diff** — line diff of the two versions via `gix::diff::blob` (imara-diff) → hunks. `memchr` for line splitting. No unified-diff text is generated or parsed, except `core/src/patch.rs`, which reads patch files for `--patch`: a patch has only hunks, so it yields a partial `FileDiff` (`known` ranges, `Row::Gap` between them) and never touches a repository.
 5. **rows** — build display-ready rows: pair deletions with additions for the split view, add filler rows, mark foldable unchanged regions. This is pure and unit-testable, and it lives in core, not tui.
 6. **tui** — app state (selection, scroll, focus, layout mode) → render.
 

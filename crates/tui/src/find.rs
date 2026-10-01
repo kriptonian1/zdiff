@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use crate::input::Field;
 use ratatui::layout::{Position, Rect};
 use zdiff_core::{Side, Text, locate};
 use zdiff_search::{Hit, MAX_HITS, Query};
@@ -12,6 +13,8 @@ use crate::app::DiffView;
 #[derive(Debug, Default)]
 pub struct Find {
     pub query: Query,
+    /// The text being typed; `query.text` mirrors it, see [`Find::set_text`].
+    pub field: Field,
     /// Sorted in screen order, so next and previous follow the rows.
     pub hits: Vec<Hit>,
     pub current: Option<usize>,
@@ -73,7 +76,11 @@ impl Toggle {
 }
 
 /// The item drawn at `position`, given `items` and the `areas` they were drawn in.
-pub fn at<T: Copy>(items: [T; 3], areas: &[Rect; 3], position: Position) -> Option<T> {
+pub fn at<T: Copy, const N: usize>(
+    items: [T; N],
+    areas: &[Rect; N],
+    position: Position,
+) -> Option<T> {
     (items.into_iter().zip(areas)).find_map(|(item, area)| area.contains(position).then_some(item))
 }
 
@@ -144,6 +151,18 @@ impl Find {
         let empty = self.hits.is_empty() && !self.query.text.is_empty();
         (format!("{at}/{total}"), empty)
     }
+
+    /// Copies the field into `query.text`, which the search crate reads.
+    pub fn sync(&mut self) {
+        self.query.text = self.field.text();
+    }
+
+    /// Replaces the text being searched.
+    #[cfg(test)]
+    pub fn set_text(&mut self, text: &str) {
+        self.field = Field::single(text);
+        self.sync();
+    }
 }
 
 #[cfg(test)]
@@ -160,10 +179,11 @@ mod tests {
             added: 1,
             removed: 1,
             change: 0,
+            staged: zdiff_core::Staged::No,
         }]);
         app.show(Some(Ok(FileDiff::new(old.into(), new.into()))));
         let mut find = Find::default();
-        find.query.text = text.into();
+        find.set_text(text);
         if let DiffPane::Loaded(view) = &app.diff {
             find.update(view);
         }
@@ -210,7 +230,7 @@ mod tests {
         };
         assert_eq!(find.current_range(view), Some((Side::Old, 0..1)));
 
-        find.query.text = "zzz".into();
+        find.set_text("zzz");
         find.update(view);
         assert_eq!(find.counter(), ("0/0".into(), true));
         find.query = Query {

@@ -155,6 +155,15 @@ pub const GRAMMARS: &[Grammar] = &[
         overrides: &[],
         first_wins: false,
     },
+    #[cfg(feature = "xml")]
+    Grammar {
+        extensions: &["svg", "xml"],
+        language: tree_sitter_xml::LANGUAGE_XML,
+        queries: &[tree_sitter_xml::XML_HIGHLIGHT_QUERY],
+        // GitHub colors attribute names like HTML's, as entities.
+        overrides: &[("property", C::Entity)],
+        first_wins: false,
+    },
 ];
 
 /// Compiled lazily on first use of each language; a failed build is cached as `None`.

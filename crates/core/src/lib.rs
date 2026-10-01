@@ -4,15 +4,18 @@
 //! with [`Repo::changes`], then load one file's hunks with [`Repo::diff`].
 
 mod diff;
+mod patch;
 mod repo;
 mod rows;
 mod words;
+mod write;
 
 use std::path::PathBuf;
 
 pub use diff::{FileDiff, Hunk, Text};
-pub use repo::{Change, Repo, Spec, Status};
-pub use rows::{Kind, Row, Side, expand, locate, reveal};
+pub use patch::{Patch, PatchFile};
+pub use repo::{Change, Repo, Spec, Staged, Status};
+pub use rows::{Kind, Row, Side, expand, locate, reveal, unified};
 pub use words::WordChanges;
 
 /// Errors returned by zdiff-core.
@@ -30,6 +33,12 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A patch file couldn't be read; `line` is 1-based.
+    #[error("line {line}: {reason}")]
+    Patch { line: usize, reason: &'static str },
+    /// Staging or committing was refused; the message says why.
+    #[error("{0}")]
+    Refused(&'static str),
     /// Any other git failure (bad revision, corrupt object, status failure).
     #[error(transparent)]
     Git(#[from] gix::Error),
