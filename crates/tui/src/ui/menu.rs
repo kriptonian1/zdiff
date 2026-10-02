@@ -19,10 +19,11 @@ fn shortcut(keymap: &Keymap, action: Action) -> String {
     (keymap.keys(action).next()).map_or_else(String::new, |(_, chord)| chord.to_string())
 }
 
-/// `item`'s name in a menu, saying why when it can't take effect: in a read-only run, or a
-/// terminal that can't draw `images`.
-fn label(item: Action, (read_only, images): (bool, bool)) -> &'static str {
+/// `item`'s name in a menu, saying why when it can't take effect: in a read-only run, a
+/// terminal that can't draw `images`, or a patch, which has no history.
+fn label(item: Action, (read_only, images, patch): (bool, bool, bool)) -> &'static str {
     match item {
+        Action::History if patch => "History… (patch mode)",
         Action::Staging if read_only => "Staging (read-only)",
         Action::ImagePreviews if !images => "Image previews (not supported)",
         Action::SvgPreviewDefault if !images => "Open SVGs as preview (not supported)",
@@ -34,7 +35,7 @@ fn label(item: Action, (read_only, images): (bool, bool)) -> &'static str {
 fn dropdown_width(items: &[Action], app: &App) -> u16 {
     let widest = (items.iter())
         .map(|&item| {
-            label(item, (app.read_only, app.images.is_some()))
+            label(item, (app.read_only, app.images.is_some(), app.patch_mode))
                 .chars()
                 .count()
                 + shortcut(&app.keymap, item).chars().count()
@@ -100,7 +101,7 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Line::from(rule).fg(c.dim), row);
             continue;
         }
-        let label = label(item, (app.read_only, app.images.is_some()));
+        let label = label(item, (app.read_only, app.images.is_some(), app.patch_mode));
         let key = shortcut(&app.keymap, item);
         let checked = match item {
             Action::Show(choice) => choice == app.view_choice,
@@ -119,6 +120,7 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &mut App) {
         let text = Span::from(format!(" {check} {label}"));
         // Read-only runs can't turn staging on, nor plain terminals draw images: greyed.
         let off = (item == Action::Staging && app.read_only)
+            || (item == Action::History && app.patch_mode)
             || (matches!(item, Action::ImagePreviews | Action::SvgPreviewDefault)
                 && app.images.is_none());
         let line = right_aligned(
@@ -164,7 +166,7 @@ mod tests {
         let buffer = render(&mut app);
         let bar = row(&buffer, 0);
         assert!(
-            bar.starts_with(" File  View  Navigate  Settings "),
+            bar.starts_with(" File  View  Navigate  Git  Settings "),
             "{bar:?}"
         );
         assert_eq!(
@@ -173,7 +175,8 @@ mod tests {
                 Rect::new(0, 0, 6, 1),
                 Rect::new(6, 0, 6, 1),
                 Rect::new(12, 0, 10, 1),
-                Rect::new(22, 0, 10, 1)
+                Rect::new(22, 0, 5, 1),
+                Rect::new(27, 0, 10, 1)
             ]
         );
         assert_eq!(buffer[(40, 0)].bg, DARK.bar, "the whole row");

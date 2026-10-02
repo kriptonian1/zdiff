@@ -4,6 +4,8 @@
 //! with [`Repo::changes`], then load one file's hunks with [`Repo::diff`].
 
 mod diff;
+mod graph;
+mod history;
 mod patch;
 mod repo;
 mod rows;
@@ -13,6 +15,8 @@ mod write;
 use std::path::PathBuf;
 
 pub use diff::{FileDiff, Hunk, Text};
+pub use graph::{Cell, GraphRow, layout};
+pub use history::Commit;
 pub use patch::{Patch, PatchFile};
 pub use repo::{Change, Repo, Spec, Staged, Status};
 pub use rows::{Kind, Row, Side, expand, locate, reveal, unified};

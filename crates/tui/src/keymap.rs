@@ -190,6 +190,7 @@ impl Keymap {
             (Global, Char('r'), ctrl, A::Reload),
             (Global, Char('q'), none, A::Quit),
             (Global, Char('r'), none, A::SvgView),
+            (Global, Char('L'), none, A::History),
             (Global, Char('i'), none, A::FocusCommit),
             (Global, Enter, ctrl, A::Commit),
             (Global, Esc, none, A::Quit),

@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod find;
+mod history;
 mod input;
 mod keymap;
 mod menu;
@@ -21,8 +22,9 @@ use std::io::{self, IsTerminal, Write};
 use std::mem;
 use std::panic;
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Instant;
 
 use clap::Parser;
 use crossterm::event::{
@@ -122,6 +124,7 @@ fn main() -> anyhow::Result<()> {
     warnings.extend(app.apply(loaded));
     // A patch is only viewed, never applied.
     app.read_only = args.read_only || args.patch.is_some();
+    app.patch_mode = args.patch.is_some();
     if !warnings.is_empty() {
         app.notice = Some(Notice::Error(format!("settings: {}", warnings.join("; "))));
     }
@@ -213,6 +216,8 @@ fn event_loop(
     let mut searcher: Option<Sender<search::Job>> = None;
     let mut dirty = true;
     let mut shown: Option<PathBuf> = None;
+    // The history popup's selected commit and its changes, kept for the preview's diffs.
+    let mut history_files: Option<(String, Snapshot)> = None;
     // Whether the shown file changed on disk and its diff must reload in place.
     let mut stale = false;
     while !app.quit {
@@ -239,8 +244,15 @@ fn event_loop(
         if dirty {
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
         }
-        dirty = match rx.recv() {
+        let Some(message) = wait(&mut app, rx) else {
+            // A toast expired: draw without it.
+            dirty = true;
+            continue;
+        };
+        dirty = match message {
             Ok(Msg::Term(event)) => app.handle(&event?),
+            // The watcher compares against the working tree, not the commit being viewed.
+            Ok(Msg::Refreshed { .. }) if app.viewing.is_some() => false,
             Ok(Msg::Refreshed {
                 snapshot: next,
                 touched,
@@ -280,6 +292,16 @@ fn event_loop(
             app.finish(run_git(repo, work).map_err(|e| e.to_string()));
             dirty = true;
         }
+        // Answers can ask for more (files, then the first file's diff), so loop until done.
+        while !app.pending_history.is_empty() {
+            for want in mem::take(&mut app.pending_history) {
+                if history_want(&mut app, source, want, &mut history_files) {
+                    // Same path, other commit: the diff must load again.
+                    shown = None;
+                }
+                dirty = true;
+            }
+        }
         if mem::take(&mut app.pending_reload) {
             stale |= reload(&mut app, source, tx);
             dirty = true;
@@ -300,6 +322,21 @@ fn event_loop(
     Ok(())
 }
 
+/// The next message, or `None` once a shown toast expires and has been cleared, so it isn't
+/// left on screen; with no toast this simply blocks.
+fn wait(app: &mut App, rx: &Receiver<Msg>) -> Option<Result<Msg, mpsc::RecvError>> {
+    let Some(toast) = &app.toast else {
+        return Some(rx.recv());
+    };
+    match rx.recv_timeout(toast.until.saturating_duration_since(Instant::now())) {
+        Err(RecvTimeoutError::Timeout) => {
+            app.toast = None;
+            None
+        }
+        message => Some(message.map_err(|_| mpsc::RecvError)),
+    }
+}
+
 /// Reloads the file list; `true` when the shown file must reload in place now.
 fn reload(app: &mut App, source: &mut Source, tx: &Sender<Msg>) -> bool {
     match source {
@@ -311,12 +348,20 @@ fn reload(app: &mut App, source: &mut Source, tx: &Sender<Msg>) -> bool {
             snapshot,
             only,
         } => {
-            if let Ok(next) = Snapshot::load(repo, spec, Some(snapshot), &Touched::All, only) {
-                let _ = tx.send(Msg::Refreshed {
-                    snapshot: next,
-                    touched: Touched::All,
-                });
+            let Ok(next) = Snapshot::load(repo, spec, Some(snapshot), &Touched::All, only) else {
+                return false;
+            };
+            // Refreshes are dropped while a commit is shown, so apply this one here: against
+            // the working tree (`w`) the files can change.
+            if app.viewing.is_some() {
+                *snapshot = next;
+                app.refresh(snapshot.entries());
+                return true;
             }
+            let _ = tx.send(Msg::Refreshed {
+                snapshot: next,
+                touched: Touched::All,
+            });
             false
         }
         Source::Patch { .. } => match source.reload_patch() {
@@ -332,6 +377,87 @@ fn reload(app: &mut App, source: &mut Source, tx: &Sender<Msg>) -> bool {
             }
         },
     }
+}
+
+/// Does history work for the popup and the commit view; `true` when the main view now shows
+/// another commit or the working tree again.
+fn history_want(
+    app: &mut App,
+    source: &mut Source,
+    want: history::Want,
+    files: &mut Option<(String, Snapshot)>,
+) -> bool {
+    let Source::Repo {
+        repo,
+        spec,
+        snapshot,
+        only,
+    } = source
+    else {
+        return false;
+    };
+    let load = |spec: &Spec| Snapshot::load(repo, spec, None, &Touched::All, only);
+    // ponytail: log, file lists and counts run on the UI thread; use a worker if big
+    // commits or long histories stall input.
+    let result = match want {
+        history::Want::Commits(limit) => repo.log(limit).map(|commits| {
+            app.history_commits(commits);
+            false
+        }),
+        history::Want::Files(commit) => load(&repo.commit_spec(&commit)).map(|snapshot| {
+            app.history_files(&commit.id, snapshot.entries());
+            *files = Some((commit.id.clone(), snapshot));
+            false
+        }),
+        history::Want::Preview { commit, path } => {
+            // The commit's changes from its file list, unless the selection moved since.
+            if files.as_ref().is_none_or(|(id, _)| *id != commit.id) {
+                match load(&repo.commit_spec(&commit)) {
+                    Ok(snapshot) => *files = Some((commit.id.clone(), snapshot)),
+                    Err(e) => {
+                        app.notice = Some(Notice::Error(format!("history: {e}")));
+                        return false;
+                    }
+                }
+            }
+            let changes = files.as_ref().map(|(_, snapshot)| &snapshot.changes);
+            let change = changes.and_then(|changes| changes.iter().find(|c| c.path == path));
+            let diff = change.map_or_else(
+                || Ok(zdiff_core::FileDiff::new(Vec::new(), Vec::new())),
+                |change| repo.diff(change),
+            );
+            app.history_preview(&commit.id, &path, diff);
+            Ok(false)
+        }
+        history::Want::Open {
+            commit,
+            file,
+            back,
+            worktree,
+        } => {
+            let next = if worktree {
+                Spec::Worktree(commit.id.clone())
+            } else {
+                repo.commit_spec(&commit)
+            };
+            load(&next).map(|files| {
+                (*spec, *snapshot) = (next, files);
+                app.refresh(snapshot.entries());
+                app.viewing_opened((&commit, worktree), file.as_deref(), back);
+                true
+            })
+        }
+        history::Want::Back => load(&Spec::default()).map(|files| {
+            (*spec, *snapshot) = (Spec::default(), files);
+            app.refresh(snapshot.entries());
+            app.viewing_closed();
+            true
+        }),
+    };
+    result.unwrap_or_else(|e| {
+        app.notice = Some(Notice::Error(format!("history: {e}")));
+        false
+    })
 }
 
 /// `path` without `.` and `..` parts, worked out from the text alone so a deleted file still
@@ -454,5 +580,138 @@ mod tests {
         );
         let error = only(root, &["src/[x"]).expect_err("a bad glob");
         assert!(error.to_string().starts_with("--focus: "), "{error}");
+    }
+
+    /// A repo with one commit adding `old.txt`, plus an uncommitted `wip.txt`, opened as zdiff
+    /// would open it.
+    fn one_commit_repo() -> (tempfile::TempDir, App, Source) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("git runs");
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("old.txt"), "1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "add old"]);
+        std::fs::write(dir.path().join("wip.txt"), "uncommitted\n").unwrap();
+
+        let repo = Repo::discover(dir.path()).expect("a repo");
+        let (spec, only) = (Spec::default(), Only::default());
+        let snapshot = Snapshot::load(&repo, &spec, None, &Touched::All, &only).expect("loads");
+        let app = App::new(snapshot.entries());
+        let source = Source::Repo {
+            repo,
+            spec,
+            snapshot,
+            only,
+        };
+        (dir, app, source)
+    }
+
+    #[test]
+    fn opening_a_commit_shows_its_files_and_back_restores_the_worktree() {
+        let (dir, mut app, mut source) = one_commit_repo();
+        let paths = |app: &App| {
+            (app.tree.files())
+                .map(|(_, f)| f.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&app), [PathBuf::from("wip.txt")]);
+
+        assert!(
+            !history_want(&mut app, &mut source, history::Want::Commits(10), &mut None),
+            "popup closed: nothing to fill"
+        );
+        let Source::Repo { repo, .. } = &source else {
+            unreachable!()
+        };
+        let commit = repo.log(1).expect("a log").remove(0);
+        let open = history::Want::Open {
+            commit: commit.clone(),
+            file: None,
+            back: Some("wip.txt".into()),
+            worktree: false,
+        };
+        assert!(history_want(&mut app, &mut source, open, &mut None));
+        assert_eq!(
+            paths(&app),
+            [PathBuf::from("old.txt")],
+            "the commit's files"
+        );
+        assert!(app.viewing.is_some() && !app.can_stage());
+
+        assert!(history_want(
+            &mut app,
+            &mut source,
+            history::Want::Back,
+            &mut None
+        ));
+        assert_eq!(
+            paths(&app),
+            [PathBuf::from("wip.txt")],
+            "the working tree again"
+        );
+        assert!(app.viewing.is_none());
+        assert!(matches!(&source, Source::Repo { spec, .. } if *spec == Spec::default()));
+
+        let against_worktree = history::Want::Open {
+            commit,
+            file: None,
+            back: None,
+            worktree: true,
+        };
+        assert!(history_want(
+            &mut app,
+            &mut source,
+            against_worktree,
+            &mut None
+        ));
+        assert_eq!(
+            paths(&app),
+            [PathBuf::from("wip.txt")],
+            "what changed since the commit"
+        );
+        let label = app
+            .viewing
+            .as_ref()
+            .map(|v| v.label.clone())
+            .unwrap_or_default();
+        assert!(label.ends_with("→ worktree"), "{label}");
+
+        // Watch refreshes are dropped while viewing, so Ctrl+R applies its own.
+        std::fs::write(dir.path().join("new.txt"), "2\n").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        assert!(reload(&mut app, &mut source, &tx));
+        assert_eq!(
+            paths(&app),
+            [PathBuf::from("new.txt"), PathBuf::from("wip.txt")]
+        );
+    }
+
+    #[test]
+    fn an_expired_toast_wakes_the_loop_and_is_cleared() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(Vec::new());
+        app.toast = Some(app::Toast {
+            text: "Copied a1b2c3d".into(),
+            until: Instant::now(),
+        });
+        assert!(
+            wait(&mut app, &rx).is_none(),
+            "no message, but the toast is due"
+        );
+        assert!(app.toast.is_none());
+        tx.send(Msg::SearchDone { generation: 0 }).unwrap();
+        assert!(matches!(
+            wait(&mut app, &rx),
+            Some(Ok(Msg::SearchDone { .. }))
+        ));
     }
 }

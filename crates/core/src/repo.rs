@@ -269,7 +269,7 @@ impl Repo {
     }
 
     pub(crate) fn tree(&self, rev: &str) -> Result<gix::Tree<'_>, Error> {
-        if rev == "HEAD" && self.inner.head()?.is_unborn() {
+        if rev == crate::history::EMPTY_TREE || (rev == "HEAD" && self.inner.head()?.is_unborn()) {
             return Ok(self.inner.empty_tree());
         }
         Ok(self.inner.rev_parse_single(rev)?.object()?.peel_to_tree()?)

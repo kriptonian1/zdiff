@@ -1,5 +1,6 @@
 mod diff;
 mod find;
+mod history;
 mod menu;
 mod palette;
 mod sidebar;
@@ -54,7 +55,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     diff::draw(frame, app, diff);
     find::draw(frame, app);
     palette::draw(frame, app);
+    history::draw(frame, app);
     menu::draw_dropdown(frame, app);
+    toast(frame, app);
+}
+
+/// The toast, bottom right above the footer, over everything else.
+fn toast(frame: &mut Frame, app: &App) {
+    let Some(toast) = &app.toast else {
+        return;
+    };
+    let c = app.shown_theme().colors();
+    let text = format!(" ✓ {} ", toast.text);
+    let screen = frame.area();
+    let width =
+        (u16::try_from(Span::from(&*text).width()).unwrap_or(u16::MAX) + 2).min(screen.width);
+    let area = Rect {
+        x: screen.right().saturating_sub(width + 1),
+        y: screen.bottom().saturating_sub(4),
+        width,
+        height: 3.min(screen.height),
+    };
+    let block = popup(c).border_style(Style::new().fg(c.green));
+    let inner = block.inner(area);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Line::from(text).fg(c.green).bold(), inner);
 }
 
 /// ` ◧ files   ZDIFF  master · HEAD → worktree` on the left, the change totals on the right.
@@ -71,16 +97,31 @@ fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
         height: 1,
         ..area
     };
-    let left = vec![
+    let compare = app.viewing.as_ref().map_or(&app.compare, |v| &v.label);
+    let read_only = app.read_only || app.viewing.is_some();
+    let mut left = vec![
         toggle,
         " ".into(),
         format!(" {} ", app.repo_name.to_uppercase())
             .fg(c.badge_fg)
             .bg(c.badge)
             .bold(),
-        format!(" {} · {}", app.branch, app.compare).fg(c.dim),
-        if app.read_only { " · read-only" } else { "" }.fg(c.dim),
+        format!(" {} · {compare}", app.branch).fg(c.dim),
+        if read_only { " · read-only" } else { "" }.fg(c.dim),
     ];
+    app.back_button = Rect::default();
+    if app.viewing.is_some() {
+        let used: usize = left.iter().map(Span::width).sum();
+        let button = Span::from(" ✕ back to worktree ").fg(c.accent).bold();
+        app.back_button = Rect {
+            x: area.x + u16::try_from(used + 2).unwrap_or(u16::MAX),
+            width: u16::try_from(button.width()).unwrap_or(u16::MAX),
+            height: 1,
+            ..area
+        }
+        .intersection(area);
+        left.extend(["  ".into(), button]);
+    }
     // ponytail: totals summed per draw, O(files); cache them in `refresh` at 10k+ changed files.
     let (files, added, removed) = (app.tree.files()).fold((0, 0, 0), |(n, a, r), (_, e)| {
         (n + 1, a + e.added, r + e.removed)

@@ -11,7 +11,7 @@ use crate::app::{DiffView, FileEntry, Shape, View, clamp_add, is_header};
 use crate::tree::Tree;
 
 /// Changed lines above which a file starts collapsed, like GitHub's large-diff notice.
-const LARGE_DIFF: u32 = 400;
+pub(crate) const LARGE_DIFF: u32 = 400;
 /// Sections kept loaded on each side of the screen.
 const PREFETCH: usize = 2;
 /// Rows above each section's body: a separator line, then the file's header.

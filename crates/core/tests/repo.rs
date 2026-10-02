@@ -527,3 +527,116 @@ fn an_added_file_needs_no_base() {
     assert!(diff.known.is_none());
     assert_eq!(diff.new.bytes(), b"one\ntwo\n");
 }
+
+/// Commits everything with message `message`, dated `seconds` after a fixed start so the
+/// history's order doesn't depend on how fast the test runs.
+fn commit_at(dir: &Path, message: &str, seconds: u32) -> String {
+    git(dir, &["add", "-A"]);
+    let date = format!("{} +0000", 1_700_000_000 + seconds);
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(["commit", "-q", "--allow-empty", "-m", message])
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .current_dir(dir)
+        .status()
+        .expect("git is installed");
+    assert!(out.success(), "git commit {message}");
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn log_lists_commits_newest_first_with_their_names() {
+    let dir = init();
+    assert!(
+        Repo::discover(dir.path())
+            .unwrap()
+            .log(10)
+            .unwrap()
+            .is_empty(),
+        "no commits yet"
+    );
+    fs::write(dir.path().join("a.txt"), "1\n").unwrap();
+    let first = commit_at(dir.path(), "first\n\nmore words", 0);
+    git(dir.path(), &["tag", "v0.1"]);
+    fs::write(dir.path().join("a.txt"), "2\n").unwrap();
+    let second = commit_at(dir.path(), "second", 10);
+    git(dir.path(), &["branch", "-m", "main"]);
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    let log = repo.log(10).unwrap();
+    let ids: Vec<_> = log.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, [second.as_str(), first.as_str()]);
+    assert!(log[0].head && !log[1].head);
+    assert_eq!(&*log[0].refs, ["main"]);
+    assert_eq!(&*log[1].refs, ["v0.1"]);
+    assert_eq!(
+        (log[1].summary.as_str(), log[1].author.as_str()),
+        ("first", "t")
+    );
+    assert_eq!(log[1].message, "first\n\nmore words");
+    assert_eq!(log[0].time - log[1].time, 10);
+    assert_eq!(&*log[0].parents, std::slice::from_ref(&first));
+    assert!(log[1].parents.is_empty());
+    assert_eq!(repo.log(1).unwrap().len(), 1, "the limit");
+}
+
+#[test]
+fn log_walks_other_branches_too() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").unwrap();
+    commit_at(dir.path(), "base", 0);
+    git(dir.path(), &["checkout", "-q", "-b", "side"]);
+    fs::write(dir.path().join("b.txt"), "1\n").unwrap();
+    let side = commit_at(dir.path(), "side work", 5);
+    git(dir.path(), &["checkout", "-q", "-"]);
+    let log = Repo::discover(dir.path()).unwrap().log(10).unwrap();
+    assert!(
+        log.iter().any(|c| c.id == side && *c.refs == ["side"]),
+        "{log:#?}"
+    );
+}
+
+#[test]
+fn commit_spec_shows_a_commit_against_its_first_parent() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").unwrap();
+    fs::write(dir.path().join("b.txt"), "1\n").unwrap();
+    commit_at(dir.path(), "root", 0);
+    fs::write(dir.path().join("a.txt"), "2\n").unwrap();
+    commit_at(dir.path(), "edit a", 5);
+    git(dir.path(), &["checkout", "-q", "-b", "side", "HEAD~1"]);
+    fs::write(dir.path().join("c.txt"), "1\n").unwrap();
+    commit_at(dir.path(), "add c", 6);
+    git(dir.path(), &["checkout", "-q", "-"]);
+    git(
+        dir.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+    );
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    let log = repo.log(10).unwrap();
+    let find = |summary: &str| log.iter().find(|c| c.summary == summary).expect(summary);
+    let files = |summary: &str| list(&repo, &repo.commit_spec(find(summary)));
+    assert_eq!(files("edit a"), [("a.txt".into(), Status::Modified)]);
+    assert_eq!(
+        files("root"),
+        [
+            ("a.txt".into(), Status::Added),
+            ("b.txt".into(), Status::Added)
+        ],
+        "against the empty tree"
+    );
+    assert_eq!(
+        files("merge side"),
+        [("c.txt".into(), Status::Added)],
+        "first parent"
+    );
+}

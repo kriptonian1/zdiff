@@ -98,6 +98,8 @@ pub enum Action {
     FocusCommit,
     /// Applies the checkboxes, then commits the index with the message.
     Commit,
+    /// Opens the recent commits.
+    History,
     /// A line between menu groups; never bound, selected, or run.
     Separator,
 }
@@ -179,6 +181,7 @@ impl Action {
             Self::SvgPreviewDefault => "svg_preview_default",
             Self::FocusCommit => "focus_commit",
             Self::Commit => "commit",
+            Self::History => "history",
             Self::Separator => "separator",
         }
     }
@@ -245,13 +248,14 @@ impl Action {
             Self::SvgPreviewDefault => "Open SVGs as preview",
             Self::FocusCommit => "Write commit message",
             Self::Commit => "Commit",
+            Self::History => "History…",
             Self::Separator => "",
         }
     }
 }
 
 /// Every menu, left to right: its title and items.
-pub const MENUS: [(&str, &[Action]); 4] = [
+pub const MENUS: [(&str, &[Action]); 5] = [
     ("File", &[Action::Reload, Action::Quit]),
     (
         "View",
@@ -297,6 +301,7 @@ pub const MENUS: [(&str, &[Action]); 4] = [
             Action::Bottom,
         ],
     ),
+    ("Git", &[Action::History]),
     (
         "Settings",
         &[

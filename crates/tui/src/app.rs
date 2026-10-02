@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -11,11 +12,12 @@ use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use resvg::usvg::fontdb::Database;
 use serde::{Deserialize, Serialize};
-use zdiff_core::{Error, FileDiff, Row, Side, Staged, Status, Text, WordChanges};
+use zdiff_core::{Commit, Error, FileDiff, Row, Side, Staged, Status, Text, WordChanges};
 use zdiff_highlight::{Language, Token};
 use zdiff_search::{Finder, Query};
 
 use crate::find::{self, Find, Toggle};
+use crate::history::{self, Button, History, Pane, Want};
 use crate::input::{Edit, Field};
 use crate::keymap::{Chord, Context, Keymap};
 use crate::menu::{self, Action, MENUS, Menu};
@@ -41,6 +43,54 @@ const H_STEP: isize = 4;
 const H_OVERSCROLL: usize = 4;
 /// Narrowest diff pane that still shows split view when no view was picked.
 const SPLIT_MIN_WIDTH: u16 = 90;
+
+/// Characters of copied text the toast quotes.
+const SNIPPET_LEN: usize = 24;
+
+/// `"first words…"`, or `"…" (3 lines)` for several: what a copy toast quotes.
+fn snippet(text: &str) -> String {
+    let lines = text.lines().count();
+    let first = text.lines().next().unwrap_or_default();
+    let quoted: String = first.chars().take(SNIPPET_LEN).collect();
+    let cut = if quoted.len() < first.len() || lines > 1 {
+        "…"
+    } else {
+        ""
+    };
+    if lines > 1 {
+        format!("\"{quoted}{cut}\" ({lines} lines)")
+    } else {
+        format!("\"{quoted}{cut}\"")
+    }
+}
+
+/// How long a toast stays up.
+const TOAST_FOR: Duration = Duration::from_secs(2);
+
+/// A short confirmation drawn over everything, gone after [`TOAST_FOR`].
+#[derive(Debug)]
+pub struct Toast {
+    pub text: String,
+    pub until: Instant,
+}
+
+impl Toast {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            until: Instant::now() + TOAST_FOR,
+        }
+    }
+}
+
+/// A commit shown in the main view instead of the working tree.
+#[derive(Debug)]
+pub struct Viewing {
+    /// `a1b2c3d^ → a1b2c3d`, for the footer.
+    pub label: String,
+    /// The file shown before, to select again when going back.
+    pub back: Option<PathBuf>,
+}
 
 /// How the diff pane lays out a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -248,6 +298,18 @@ pub struct App {
     pub quit: bool,
     /// What `--focus` shows, as `src/app.rs` or `3 paths`; `None` without it.
     pub only: Option<String>,
+    /// The history popup while it is open.
+    pub history: Option<Box<History>>,
+    /// History work for the event loop, which holds the repository.
+    pub pending_history: Vec<Want>,
+    /// The commit the main view shows instead of the working tree.
+    pub viewing: Option<Viewing>,
+    /// The footer's back-to-worktree button from the last draw, for clicks.
+    pub back_button: Rect,
+    /// Viewing a patch file, which has no history.
+    pub patch_mode: bool,
+    /// A confirmation such as `Copied a1b2c3d`; the event loop clears it when it expires.
+    pub toast: Option<Toast>,
     /// How the terminal draws images; `None` when it can't, so previews are text only.
     pub images: Option<Picker>,
     /// Whether changed images are drawn as pictures; a setting.
@@ -339,6 +401,12 @@ impl App {
             palette_area: Rect::default(),
             quit: false,
             only: None,
+            history: None,
+            pending_history: Vec::new(),
+            viewing: None,
+            back_button: Rect::default(),
+            patch_mode: false,
+            toast: None,
             images: None,
             image_previews: true,
             image_compare: Compare::default(),
@@ -464,7 +532,7 @@ impl App {
 
     /// Whether staging controls show and work: the preference, unless running read-only.
     pub fn can_stage(&self) -> bool {
-        self.staging && !self.read_only
+        self.staging && !self.read_only && self.viewing.is_none()
     }
 
     /// Ticks every file at `row`, or unticks them when all are already on; with staging off,
@@ -564,6 +632,9 @@ impl App {
 
     /// Pastes into the focused text field; a line number keeps only its digits.
     fn paste(&mut self, text: &str) -> bool {
+        if self.history.as_ref().is_some_and(|h| h.typing) {
+            return self.history_search_edit(|field| field.paste(text));
+        }
         let digits: String;
         let text = if matches!(
             &self.palette,
@@ -622,8 +693,9 @@ impl App {
         if research {
             self.search();
         }
-        if copied.is_some() {
-            self.pending_copy = copied;
+        if let Some(text) = copied {
+            let label = snippet(&text);
+            self.copy(text, &label);
         }
         (edit != Edit::Ignored).then_some(true)
     }
@@ -866,10 +938,289 @@ impl App {
         true
     }
 
+    /// Opens the history popup and asks for its first page.
+    fn open_history(&mut self) -> bool {
+        if self.patch_mode {
+            self.notice = Some(Notice::Error("a patch has no history".into()));
+            return true;
+        }
+        let (history, want) = History::new();
+        self.history = Some(Box::new(history));
+        self.palette = None;
+        self.pending_history.push(want);
+        true
+    }
+
+    /// Keys while the history popup is open; it takes them all, like the open menu.
+    fn history_key(&mut self, key: KeyEvent) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        if history.typing {
+            return self.history_search_key(key);
+        }
+        let half = page(history.preview_area) / 2;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = page(match history.pane {
+            Pane::Preview => history.preview_area,
+            _ => history.list_area,
+        });
+        let button = match key.code {
+            KeyCode::Char('d') if ctrl => return history.scroll_preview(half),
+            KeyCode::Char('u') if ctrl => return history.scroll_preview(-half),
+            KeyCode::Tab | KeyCode::BackTab => return history.switch_pane(),
+            KeyCode::Char(']') => return history.preview_change(true),
+            KeyCode::Char('[') => return history.preview_change(false),
+            KeyCode::Esc => Button::Back,
+            KeyCode::Enter => Button::Enter,
+            KeyCode::Char('/') => Button::Search,
+            KeyCode::Char('o') => Button::Open,
+            KeyCode::Char('w') => Button::Worktree,
+            KeyCode::Char('y') => Button::Copy,
+            code => {
+                let delta = match code {
+                    KeyCode::Down | KeyCode::Char('j') => 1,
+                    KeyCode::Up | KeyCode::Char('k') => -1,
+                    KeyCode::PageDown => page,
+                    KeyCode::PageUp => -page,
+                    KeyCode::Home | KeyCode::Char('g') => isize::MIN / 2,
+                    KeyCode::End | KeyCode::Char('G') => isize::MAX / 2,
+                    _ => return false,
+                };
+                let (moved, wants) = history.step(delta);
+                self.pending_history.extend(wants);
+                return moved;
+            }
+        };
+        self.history_press(button)
+    }
+
+    /// Keys while typing a history search: text goes to the box, arrows still move.
+    fn history_search_key(&mut self, key: KeyEvent) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                let wants = history.clear_search();
+                self.pending_history.extend(wants);
+                true
+            }
+            KeyCode::Enter => {
+                history.typing = false;
+                true
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let (moved, wants) = history.step(if key.code == KeyCode::Up { -1 } else { 1 });
+                self.pending_history.extend(wants);
+                moved
+            }
+            _ => self.history_search_edit(|field| field.key(key)),
+        }
+    }
+
+    /// Edits the history search with `act`, filtering again when the text changed.
+    fn history_search_edit(&mut self, act: impl FnOnce(&mut Field) -> Edit) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        let Some(field) = &mut history.search else {
+            return false;
+        };
+        let edit = act(field);
+        let copied = field.take_copied();
+        if edit == Edit::Changed {
+            let wants = history.filter();
+            self.pending_history.extend(wants);
+        }
+        if let Some(text) = copied {
+            let label = snippet(&text);
+            self.copy(text, &label);
+        }
+        edit != Edit::Ignored
+    }
+
+    /// Sends `text` to the clipboard and confirms it with a `Copied {label}` toast.
+    fn copy(&mut self, text: String, label: &str) {
+        self.toast = Some(Toast::new(format!("Copied {label}")));
+        self.pending_copy = Some(text);
+    }
+
+    /// Does what a hint-row button or its key does.
+    fn history_press(&mut self, button: Button) -> bool {
+        let back = match &self.viewing {
+            Some(viewing) => viewing.back.clone(),
+            None => self.selected_file().map(|f| f.path.clone()),
+        };
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        let reply = history.press(button, back);
+        self.pending_history.extend(reply.wants);
+        if let Some(id) = reply.copy {
+            let label = history::short(&id).to_owned();
+            self.copy(id, &label);
+        }
+        if reply.close {
+            self.history = None;
+        }
+        reply.redraw
+    }
+
+    /// Mouse over the history popup: buttons press, the hash copies, rows select and a second
+    /// click goes one step in; a click outside closes.
+    fn history_mouse(&mut self, kind: MouseEventKind, position: Position) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        let click = kind == MouseEventKind::Down(MouseButton::Left);
+        let wheel = match kind {
+            MouseEventKind::ScrollDown => WHEEL_STEP,
+            MouseEventKind::ScrollUp => -WHEEL_STEP,
+            _ if !click => return false,
+            _ if !history.area.contains(position) => {
+                self.history = None;
+                return true;
+            }
+            _ => 0,
+        };
+        if click {
+            let pressed = (history.buttons.iter())
+                .find(|(area, _)| area.contains(position))
+                .map(|&(_, button)| button);
+            let button = pressed
+                .or_else(|| {
+                    (history.copy_areas.iter().any(|a| a.contains(position)))
+                        .then_some(Button::Copy)
+                })
+                .or_else(|| {
+                    history
+                        .search_area
+                        .contains(position)
+                        .then_some(Button::Search)
+                });
+            if history.clear_area.contains(position) {
+                let wants = history.clear_search();
+                self.pending_history.extend(wants);
+                return true;
+            }
+            if let Some(button) = button {
+                return self.history_press(button);
+            }
+            // A click elsewhere ends typing and keeps the search.
+            history.typing = false;
+        }
+        if history.preview_area.contains(position) {
+            if wheel != 0 {
+                return history.scroll_preview(wheel);
+            }
+            let open = history.preview.is_some();
+            if open {
+                history.pane = Pane::Preview;
+            }
+            return open;
+        }
+        let (pane, area, top, at) = if history.files_area.contains(position) {
+            let at = history.file;
+            (
+                Pane::Files,
+                history.files_area,
+                history.file_scroll,
+                Some(at),
+            )
+        } else if history.list_area.contains(position) {
+            let at = history.position();
+            (Pane::Commits, history.list_area, history.scroll, at)
+        } else {
+            return click;
+        };
+        history.pane = pane;
+        if wheel != 0 {
+            let (_, wants) = history.step(wheel);
+            self.pending_history.extend(wants);
+            return true;
+        }
+        let Some(at) = at else {
+            return false;
+        };
+        let row = top + usize::from(position.y - area.y);
+        if row == at {
+            let (moved, want) = history.enter();
+            self.pending_history.extend(want);
+            return moved;
+        }
+        let delta = isize::try_from(row).unwrap_or(isize::MAX) - isize::try_from(at).unwrap_or(0);
+        let (moved, wants) = history.step(delta);
+        self.pending_history.extend(wants);
+        moved
+    }
+
+    /// The history popup's commits arrived.
+    pub fn history_commits(&mut self, commits: Vec<Commit>) {
+        if let Some(history) = &mut self.history {
+            self.pending_history.extend(history.loaded(commits));
+        }
+    }
+
+    /// The files of commit `id` arrived, for the popup.
+    pub fn history_files(&mut self, id: &str, files: Vec<FileEntry>) {
+        if let Some(history) = &mut self.history {
+            self.pending_history.extend(history.files_loaded(id, files));
+        }
+    }
+
+    /// The diff of `path` in commit `id` arrived, for the popup's unified preview.
+    pub fn history_preview(&mut self, id: &str, path: &Path, diff: Result<FileDiff, Error>) {
+        let language = zdiff_highlight::language(path).filter(|_| self.syntax);
+        let shape = Shape {
+            view: View::Unified,
+            context: self.context,
+        };
+        let Some(history) = &mut self.history else {
+            return;
+        };
+        // A file that can't be read previews as nothing changed, rather than an error box.
+        let file = diff.unwrap_or_else(|_| FileDiff::new(Vec::new(), Vec::new()));
+        history.preview_loaded(id, path, DiffView::new(file, language, shape));
+    }
+
+    /// The main view now shows `commit`; `refresh` already listed its files.
+    pub fn viewing_opened(
+        &mut self,
+        (commit, worktree): (&Commit, bool),
+        file: Option<&Path>,
+        back: Option<PathBuf>,
+    ) {
+        self.history = None;
+        self.viewing = Some(Viewing {
+            label: history::label(commit, worktree),
+            back,
+        });
+        self.select_path(file);
+    }
+
+    /// The main view shows the working tree again; `refresh` already listed its files.
+    pub fn viewing_closed(&mut self) {
+        let back = self.viewing.take().and_then(|v| v.back);
+        self.select_path(back.as_deref());
+    }
+
+    /// Selects the file at `path` when it's listed, else the first file.
+    fn select_path(&mut self, path: Option<&Path>) {
+        let row = path.and_then(|path| self.tree.find(path));
+        let row = row.or_else(|| (0..self.tree.len()).find(|&r| self.tree.file_at(r).is_some()));
+        if let Some(row) = row {
+            self.select(row);
+        }
+    }
+
     /// Whether the diff pane draws the shown image as pictures: no popup covers it.
     /// A text file has pictures only as an SVG in Preview, so popups show its code.
     pub fn picture_shown(&self) -> bool {
-        let popup = self.palette.is_some() || self.menu.open.is_some() || self.find.is_some();
+        let popup = self.palette.is_some()
+            || self.menu.open.is_some()
+            || self.find.is_some()
+            || self.history.is_some();
         !popup
             && self.stream.is_none()
             && matches!(&self.diff, DiffPane::Loaded(view)
@@ -997,9 +1348,20 @@ impl App {
         if self.menu.open.is_some() && global != Some(Action::OpenMenu) {
             return self.menu_key(key.code);
         }
+        if self.history.is_some() {
+            return self.history_key(key);
+        }
         let typing = self.palette.is_some() || self.find.is_some() || self.writing;
         if let Some(redraw) = self.field_key(key) {
             return redraw;
+        }
+        // Esc quits, except while a commit is shown: then it goes back to the working tree.
+        if self.viewing.is_some()
+            && !typing
+            && chord == Chord::new(KeyCode::Esc, KeyModifiers::NONE)
+        {
+            self.pending_history.push(Want::Back);
+            return true;
         }
         // Over a text input only Ctrl, Alt, and F-keys reach bindings, so letters stay text.
         if let Some(action) = global.filter(|_| !typing || chord.is_command()) {
@@ -1111,6 +1473,7 @@ impl App {
             | Action::SvgPreviewDefault
             | Action::Staging => self.settings_action(action),
             Action::SvgView | Action::ImageCompare => self.picture_action(action),
+            Action::History => self.open_history(),
             Action::Theme => {
                 self.palette = Some(Palette::themes(self.theme));
                 true
@@ -1714,7 +2077,7 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let position = Position::new(mouse.column, mouse.row);
         let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
-        let over = self.menu.open.is_some() || self.palette.is_some();
+        let over = self.menu.open.is_some() || self.palette.is_some() || self.history.is_some();
         if click && !over && self.commit_box.contains(position) {
             return !mem::replace(&mut self.writing, true);
         }
@@ -1753,6 +2116,13 @@ impl App {
         }
         if self.palette.is_some() {
             return self.palette_mouse(mouse, position);
+        }
+        if self.history.is_some() {
+            return self.history_mouse(mouse.kind, position);
+        }
+        if click && self.viewing.is_some() && self.back_button.contains(position) {
+            self.pending_history.push(Want::Back);
+            return true;
         }
         if let Some(moved) = self.compare_mouse(mouse.kind, position) {
             return moved;
@@ -2080,7 +2450,7 @@ impl DiffView {
         moved
     }
 
-    fn scroll_by(&mut self, delta: isize, height: usize) -> bool {
+    pub(crate) fn scroll_by(&mut self, delta: isize, height: usize) -> bool {
         self.scroll_to(clamp_add(self.scroll, delta, usize::MAX), height)
     }
 
@@ -2102,7 +2472,7 @@ impl DiffView {
         }
     }
 
-    fn next_header(&mut self, height: usize) -> bool {
+    pub(crate) fn next_header(&mut self, height: usize) -> bool {
         let start = self.scroll + 1;
         match self.rows.iter().skip(start).position(is_header) {
             Some(offset) => self.scroll_to(start + offset, height),
@@ -2110,7 +2480,7 @@ impl DiffView {
         }
     }
 
-    fn prev_header(&mut self, height: usize) -> bool {
+    pub(crate) fn prev_header(&mut self, height: usize) -> bool {
         match self.rows[..self.scroll].iter().rposition(is_header) {
             Some(row) => self.scroll_to(row, height),
             None => false,
@@ -2359,7 +2729,8 @@ mod tests {
             Rect::new(0, 0, 6, 1),
             Rect::new(6, 0, 6, 1),
             Rect::new(12, 0, 10, 1),
-            Rect::new(22, 0, 10, 1),
+            Rect::new(22, 0, 5, 1),
+            Rect::new(27, 0, 10, 1),
         ];
         app.menu.item_areas[..3].copy_from_slice(&[
             Rect::new(1, 2, 26, 1),
@@ -3542,6 +3913,31 @@ mod tests {
     }
 
     #[test]
+    fn copy_toasts_quote_the_start_of_the_text() {
+        assert_eq!(snippet("fix bug"), "\"fix bug\"");
+        assert_eq!(snippet(&"x".repeat(30)), format!("\"{}…\"", "x".repeat(24)));
+        assert_eq!(snippet("first\nsecond\nthird"), "\"first…\" (3 lines)");
+    }
+
+    #[test]
+    fn searching_history_and_copying_the_query_toasts_too() {
+        let mut app = history_open();
+        press(&mut app, KeyCode::Char('/'));
+        type_into(&mut app, "theme");
+        key_with(&mut app, KeyCode::Home, KeyModifiers::SHIFT);
+        assert!(key_with(
+            &mut app,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+        assert_eq!(app.pending_copy.as_deref(), Some("theme"));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("Copied \"theme\"")
+        );
+    }
+
+    #[test]
     fn cutting_in_the_find_bar_copies_and_finds_again() {
         let mut app = diff_app();
         ctrl(&mut app, 'f');
@@ -3553,6 +3949,12 @@ mod tests {
         );
         assert!(ctrl(&mut app, 'x'));
         assert_eq!(app.pending_copy.as_deref(), Some("teen"));
+        let toast = app.toast.as_ref().map(|t| t.text.as_str());
+        assert_eq!(
+            toast,
+            Some("Copied \"teen\""),
+            "text fields confirm copies too"
+        );
         assert_eq!(
             app.find.as_ref().map(|f| f.query.text.as_str()),
             Some("fif ")
@@ -4159,6 +4561,243 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(app.svg_view, SvgView::Code);
         assert!(notice(&app).contains("previews are off"));
+    }
+
+    #[test]
+    fn shift_l_opens_history_and_moving_asks_for_commits_and_files() {
+        use crate::history::{PAGE, commit};
+        let mut app = app(&["a.rs"]);
+        assert!(press(&mut app, KeyCode::Char('L')));
+        assert_eq!(mem::take(&mut app.pending_history), [Want::Commits(PAGE)]);
+        app.history_commits(vec![commit("c1", &["c2"]), commit("c2", &[])]);
+        let wants = mem::take(&mut app.pending_history);
+        assert!(
+            matches!(&wants[..], [Want::Files(c)] if c.id == "c1"),
+            "{wants:?}"
+        );
+        assert!(
+            press(&mut app, KeyCode::Char('j')),
+            "the popup takes the keys"
+        );
+        let wants = mem::take(&mut app.pending_history);
+        assert!(
+            matches!(&wants[..], [Want::Files(c)] if c.id == "c2"),
+            "{wants:?}"
+        );
+        app.history_files("c2", vec![entry("b.rs")]);
+        let wants = mem::take(&mut app.pending_history);
+        let [Want::Preview { commit, path }] = &wants[..] else {
+            panic!("the first file's diff: {wants:?}")
+        };
+        assert_eq!(
+            (commit.id.as_str(), path.as_path()),
+            ("c2", Path::new("b.rs"))
+        );
+        assert!(press(&mut app, KeyCode::Enter), "into the files");
+        assert!(!press(&mut app, KeyCode::Enter), "no preview loaded yet");
+        let diff = FileDiff::new(b"a\n".to_vec(), b"b\n".to_vec());
+        app.history_preview("c2", Path::new("b.rs"), Ok(diff));
+        assert!(press(&mut app, KeyCode::Enter), "into the preview");
+        assert_eq!(app.history.as_ref().map(|h| h.pane), Some(Pane::Preview));
+        assert!(press(&mut app, KeyCode::Esc), "back to the files");
+        assert!(app.history.is_some());
+        assert!(press(&mut app, KeyCode::Char('o')), "open in the main view");
+        let wants = mem::take(&mut app.pending_history);
+        let [
+            Want::Open {
+                commit,
+                file,
+                back,
+                worktree: false,
+            },
+        ] = &wants[..]
+        else {
+            panic!("{wants:?}")
+        };
+        assert_eq!(commit.id, "c2");
+        assert_eq!(
+            (file.as_deref(), back.as_deref()),
+            (Some(Path::new("b.rs")), Some(Path::new("a.rs")))
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            press(&mut app, KeyCode::Esc),
+            "files, then commits, then closed"
+        );
+        assert!(
+            app.history.is_none() && !app.quit,
+            "Esc closes the popup only"
+        );
+    }
+
+    /// App with the history popup open on three commits, `c1` selected, drawn once.
+    fn history_open() -> App {
+        use crate::history::commit;
+        let mut app = app(&["a.rs"]);
+        press(&mut app, KeyCode::Char('L'));
+        let mut commits = vec![
+            commit("c1", &["c2"]),
+            commit("c2", &["c3"]),
+            commit("c3", &[]),
+        ];
+        commits[1].summary = "fix the theme".into();
+        app.history_commits(commits);
+        app.pending_history.clear();
+        crate::ui::render(&mut app, 140, 30);
+        app
+    }
+
+    fn type_into(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    #[test]
+    fn slash_searches_arrows_move_while_typing_and_esc_clears_first() {
+        let mut app = history_open();
+        assert!(press(&mut app, KeyCode::Char('/')));
+        type_into(&mut app, "theme");
+        let history = app.history.as_ref().expect("open");
+        assert_eq!(
+            history.query(),
+            "theme",
+            "letters go to the box, not to j/k or w"
+        );
+        assert_eq!((history.shown.as_slice(), history.selected), (&[1][..], 1));
+        assert!(press(&mut app, KeyCode::Enter));
+        assert!(
+            !app.history.as_ref().is_some_and(|h| h.typing),
+            "Enter keeps the filter"
+        );
+        assert!(press(&mut app, KeyCode::Esc));
+        assert!(
+            app.history.as_ref().is_some_and(|h| h.search.is_none()),
+            "Esc clears it"
+        );
+        assert!(press(&mut app, KeyCode::Esc));
+        assert!(app.history.is_none(), "then closes");
+    }
+
+    #[test]
+    fn y_copies_the_hash_and_w_opens_against_the_worktree() {
+        let mut app = history_open();
+        assert!(press(&mut app, KeyCode::Char('y')));
+        assert_eq!(app.pending_copy.take().as_deref(), Some("c1"));
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("Copied c1")
+        );
+        let screen = crate::ui::render(&mut app, 140, 30);
+        let toast = screen.iter().position(|row| row.contains("✓ Copied c1 "));
+        let toast = toast.expect("drawn over the popup");
+        assert!(
+            toast >= screen.len() - 4,
+            "bottom, above the footer: {screen:#?}"
+        );
+        assert!(
+            screen[toast].trim_end().ends_with("│"),
+            "right edge: {screen:#?}"
+        );
+        assert!(press(&mut app, KeyCode::Char('w')));
+        assert!(matches!(
+            &app.pending_history[..],
+            [Want::Open { worktree: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn the_mouse_presses_buttons_copies_the_hash_and_drives_the_search() {
+        let mut app = history_open();
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let click = |app: &mut App, area: Rect| app.handle(&mouse(down, area.x, area.y));
+        let button = |app: &App, which: Button| {
+            let history = app.history.as_ref().expect("open");
+            (history.buttons.iter())
+                .find(|(_, b)| *b == which)
+                .expect("drawn")
+                .0
+        };
+        let copy = button(&app, Button::Copy);
+        assert!(click(&mut app, copy));
+        assert_eq!(app.pending_copy.take().as_deref(), Some("c1"));
+        let hash = app.history.as_ref().expect("open").copy_areas[0];
+        assert!(click(&mut app, hash), "the hash in the details copies too");
+        assert_eq!(app.pending_copy.take().as_deref(), Some("c1"));
+        let worktree = button(&app, Button::Worktree);
+        assert!(click(&mut app, worktree));
+        assert!(matches!(
+            &app.pending_history[..],
+            [Want::Open { worktree: true, .. }]
+        ));
+
+        let search = button(&app, Button::Search);
+        assert!(click(&mut app, search));
+        type_into(&mut app, "theme");
+        crate::ui::render(&mut app, 140, 30);
+        let clear = app.history.as_ref().expect("open").clear_area;
+        assert!(click(&mut app, clear));
+        assert!(
+            app.history
+                .as_ref()
+                .is_some_and(|h| h.search.is_none() && !h.typing)
+        );
+    }
+
+    #[test]
+    fn a_viewed_commit_is_read_only_and_esc_goes_back_to_the_working_tree() {
+        let mut app = app(&["a.rs", "b.rs"]);
+        assert!(app.can_stage());
+        app.refresh(vec![entry("x.rs"), entry("y.rs")]);
+        let commit = crate::history::commit("c1", &["c0"]);
+        app.viewing_opened(
+            (&commit, false),
+            Some(Path::new("y.rs")),
+            Some("b.rs".into()),
+        );
+        assert!(!app.can_stage(), "no staging on a commit");
+        assert_eq!(
+            app.selected_file().map(|f| f.path.clone()),
+            Some("y.rs".into())
+        );
+        let screen = crate::ui::render(&mut app, 100, 8);
+        let footer = screen.last().expect("a footer");
+        assert!(
+            footer.contains("c1^ → c1 · read-only") && footer.contains("✕ back to worktree"),
+            "{footer}"
+        );
+
+        assert!(press(&mut app, KeyCode::Esc));
+        assert_eq!(mem::take(&mut app.pending_history), [Want::Back]);
+        assert!(!app.quit, "Esc goes back instead of quitting");
+        app.refresh(vec![entry("a.rs"), entry("b.rs")]);
+        app.viewing_closed();
+        assert!(app.viewing.is_none() && app.can_stage());
+        assert_eq!(
+            app.selected_file().map(|f| f.path.clone()),
+            Some("b.rs".into())
+        );
+    }
+
+    #[test]
+    fn the_footer_button_goes_back_too() {
+        let mut app = app(&["a.rs"]);
+        app.viewing_opened((&crate::history::commit("c1", &[]), false), None, None);
+        crate::ui::render(&mut app, 100, 8);
+        let button = app.back_button;
+        assert!(!button.is_empty());
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert!(app.handle(&mouse(down, button.x, button.y)));
+        assert_eq!(app.pending_history, [Want::Back]);
+    }
+
+    #[test]
+    fn a_patch_has_no_history() {
+        let mut app = app(&["a.rs"]);
+        app.patch_mode = true;
+        assert!(press(&mut app, KeyCode::Char('L')));
+        assert!(app.history.is_none() && app.pending_history.is_empty());
+        assert!(matches!(&app.notice, Some(Notice::Error(text)) if text.contains("no history")));
     }
 
     #[test]

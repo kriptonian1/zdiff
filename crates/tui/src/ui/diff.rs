@@ -269,7 +269,7 @@ fn draw_two_up(frame: &mut Frame, c: &Colors, preview: &mut Preview, layout: Vie
 
 /// How rows are painted: the view, which highlights are on, and the colors.
 #[derive(Debug, Clone, Copy)]
-struct Paint {
+pub(super) struct Paint {
     layout: View,
     words: bool,
     syntax: bool,
@@ -277,6 +277,14 @@ struct Paint {
 }
 
 impl Paint {
+    /// How the history popup's preview is painted: the app's highlights, always unified.
+    pub(super) fn unified(app: &App) -> Self {
+        Self {
+            layout: View::Unified,
+            ..Self::of(app)
+        }
+    }
+
     fn of(app: &App) -> Self {
         Self {
             layout: app.view,
@@ -288,6 +296,15 @@ impl Paint {
 }
 
 /// Renders only the rows that fit on screen, so cost follows screen height, not file size.
+/// `view`'s rows in `area`, or why it has none; for the history preview.
+pub(super) fn draw_view(frame: &mut Frame, view: &mut DiffView, paint: Paint, area: Rect) {
+    if view.rows.is_empty() {
+        message(frame.buffer_mut(), paint.colors, area, &empty_reason(view));
+    } else {
+        draw_rows(frame, view, paint, None, area);
+    }
+}
+
 fn draw_rows(
     frame: &mut Frame,
     view: &mut DiffView,
