@@ -205,6 +205,7 @@ impl Keymap {
             (Global, Char('='), none, A::MoreContext),
             (Global, Char('-'), none, A::LessContext),
             (Global, Char('w'), none, A::WordHighlights),
+            (Global, Char('Z'), none, A::Stash),
             (Diff, Char('j'), none, A::ScrollDown),
             (Diff, Down, none, A::ScrollDown),
             (Diff, Char('k'), none, A::ScrollUp),

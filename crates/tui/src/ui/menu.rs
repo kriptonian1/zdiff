@@ -24,6 +24,7 @@ fn shortcut(keymap: &Keymap, action: Action) -> String {
 fn label(item: Action, (read_only, images, patch): (bool, bool, bool)) -> &'static str {
     match item {
         Action::History if patch => "History… (patch mode)",
+        Action::Stash if patch => "Stash… (patch mode)",
         Action::Staging if read_only => "Staging (read-only)",
         Action::ImagePreviews if !images => "Image previews (not supported)",
         Action::SvgPreviewDefault if !images => "Open SVGs as preview (not supported)",
@@ -120,7 +121,7 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &mut App) {
         let text = Span::from(format!(" {check} {label}"));
         // Read-only runs can't turn staging on, nor plain terminals draw images: greyed.
         let off = (item == Action::Staging && app.read_only)
-            || (item == Action::History && app.patch_mode)
+            || (matches!(item, Action::History | Action::Stash) && app.patch_mode)
             || (matches!(item, Action::ImagePreviews | Action::SvgPreviewDefault)
                 && app.images.is_none());
         let line = right_aligned(

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use zdiff_core::{Change, Error, Hunk, Patch, Repo, Spec, Staged, Status};
+use zdiff_core::{Change, Error, Hunk, Patch, Repo, Spec, Staged, StashOp, StashPush, Status};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -639,4 +639,204 @@ fn commit_spec_shows_a_commit_against_its_first_parent() {
         [("c.txt".into(), Status::Added)],
         "first parent"
     );
+}
+
+/// A repo with `a.txt` committed, then `a.txt` edited and stashed twice: `first`, then
+/// `second` (stash@{0}).
+fn stashed() -> (tempfile::TempDir, Repo) {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    for message in ["first", "second"] {
+        fs::write(dir.path().join("a.txt"), format!("{message}\n")).expect("write");
+        git(dir.path(), &["stash", "push", "-q", "-m", message]);
+    }
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    (dir, repo)
+}
+
+/// Each stash's message, without git's `On <branch>: ` prefix.
+fn summaries(repo: &Repo) -> Vec<String> {
+    let stashes = repo.stashes().expect("stashes");
+    let message = |s: &str| s.split_once(": ").map_or(s, |(_, m)| m).to_owned();
+    stashes.iter().map(|s| message(&s.summary)).collect()
+}
+
+#[test]
+fn no_stash_lists_nothing() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    assert!(
+        Repo::discover(dir.path())
+            .expect("a repo")
+            .stashes()
+            .expect("stashes")
+            .is_empty()
+    );
+}
+
+#[test]
+fn stashes_list_newest_first_against_their_base() {
+    let (dir, repo) = stashed();
+    let stashes = repo.stashes().expect("stashes");
+    assert_eq!(summaries(&repo), ["second", "first"]);
+    assert_eq!(&*stashes[0].refs, ["stash@{0}"]);
+    assert_eq!(&*stashes[1].refs, ["stash@{1}"]);
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(&*stashes[0].parents, [head], "only the base");
+    let files = list(&repo, &repo.commit_spec(&stashes[0]));
+    assert_eq!(files, [("a.txt".to_owned(), Status::Modified)]);
+}
+
+#[test]
+fn apply_keeps_the_stash_and_pop_removes_it() {
+    let (dir, repo) = stashed();
+    let read = || fs::read_to_string(dir.path().join("a.txt")).expect("read");
+    let stashes = repo.stashes().expect("stashes");
+    assert!(
+        repo.stash(StashOp::Apply, &stashes[1].id)
+            .expect("applies")
+            .is_empty()
+    );
+    assert_eq!(read(), "first\n");
+    assert_eq!(summaries(&repo).len(), 2);
+    git(dir.path(), &["checkout", "--", "a.txt"]);
+    assert!(
+        repo.stash(StashOp::Pop, &stashes[0].id)
+            .expect("runs")
+            .is_empty()
+    );
+    assert_eq!(read(), "second\n");
+    assert_eq!(summaries(&repo), ["first"]);
+}
+
+#[test]
+fn drop_finds_its_stash_by_id_after_the_list_changes() {
+    let (dir, repo) = stashed();
+    let old = repo.stashes().expect("stashes");
+    fs::write(dir.path().join("a.txt"), "third\n").expect("write");
+    git(dir.path(), &["stash", "push", "-q", "-m", "third"]);
+    repo.stash(StashOp::Drop, &old[0].id).expect("drops");
+    assert_eq!(summaries(&repo), ["third", "first"]);
+    let gone = repo.stash(StashOp::Drop, &old[0].id);
+    assert!(matches!(gone, Err(Error::Refused(_))), "{gone:?}");
+}
+
+#[test]
+fn a_conflicting_pop_reports_the_path_and_keeps_the_stash() {
+    let (dir, repo) = stashed();
+    fs::write(dir.path().join("a.txt"), "committed\n").expect("write");
+    commit(dir.path());
+    let stashes = repo.stashes().expect("stashes");
+    let conflicts = repo.stash(StashOp::Pop, &stashes[0].id).expect("runs");
+    assert_eq!(conflicts, [PathBuf::from("a.txt")]);
+    assert_eq!(summaries(&repo).len(), 2, "kept");
+}
+
+#[test]
+fn local_changes_in_the_way_are_a_command_error() {
+    let (dir, repo) = stashed();
+    fs::write(dir.path().join("a.txt"), "dirty\n").expect("write");
+    let stashes = repo.stashes().expect("stashes");
+    let error = repo
+        .stash(StashOp::Apply, &stashes[0].id)
+        .expect_err("refused by git");
+    assert!(
+        matches!(error, Error::Command { cmd: "apply", .. }),
+        "{error}"
+    );
+}
+
+/// A repo with `a.txt` committed, then edited, and an untracked `new.txt`.
+fn dirty() -> (tempfile::TempDir, Repo) {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    fs::write(dir.path().join("a.txt"), "2\n").expect("write");
+    fs::write(dir.path().join("new.txt"), "fresh\n").expect("write");
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    (dir, repo)
+}
+
+#[test]
+fn a_stash_with_untracked_files_lists_and_previews_them() {
+    let (dir, repo) = dirty();
+    let push = StashPush {
+        message: "wip".into(),
+        untracked: true,
+        ..StashPush::default()
+    };
+    assert!(repo.stash_push(&push).expect("stashes"));
+    assert!(!dir.path().join("new.txt").exists());
+    let stash = repo.stashes().expect("stashes").remove(0);
+    assert!(stash.summary.ends_with(": wip"), "{}", stash.summary);
+    let changes = repo.changes(&repo.commit_spec(&stash)).expect("changes");
+    assert_eq!(
+        summary(&changes),
+        [
+            ("a.txt".to_owned(), Status::Modified),
+            ("new.txt".to_owned(), Status::Untracked)
+        ]
+    );
+    let diff = repo.diff(&changes[1]).expect("diff");
+    assert_eq!(diff.new.bytes(), b"fresh\n");
+}
+
+#[test]
+fn pushing_nothing_says_so() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    assert!(!repo.stash_push(&StashPush::default()).expect("runs"));
+    assert!(repo.stashes().expect("stashes").is_empty());
+}
+
+#[test]
+fn staged_only_and_keep_index_stash_what_they_say() {
+    let (dir, repo) = dirty();
+    git(dir.path(), &["add", "a.txt"]);
+    let staged = StashPush {
+        staged: true,
+        ..StashPush::default()
+    };
+    assert!(repo.stash_push(&staged).expect("stashes"));
+    assert_eq!(
+        status(dir.path()),
+        "?? new.txt",
+        "only the staged file went"
+    );
+
+    git(dir.path(), &["stash", "pop", "-q", "--index"]);
+    let keep = StashPush {
+        keep_index: true,
+        ..StashPush::default()
+    };
+    assert!(repo.stash_push(&keep).expect("stashes"));
+    assert_eq!(
+        status(dir.path()),
+        "M  a.txt\n?? new.txt",
+        "the index stays"
+    );
+}
+
+#[test]
+fn a_branch_from_a_stash_restores_it_and_drops_it() {
+    let (dir, repo) = dirty();
+    assert!(repo.stash_push(&StashPush::default()).expect("stashes"));
+    let stash = repo.stashes().expect("stashes").remove(0);
+    let refused = repo.stash_branch(&stash.id, "-x");
+    assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+    assert!(
+        repo.stash_branch(&stash.id, "try-it")
+            .expect("branches")
+            .is_empty()
+    );
+    assert_eq!(repo.head_name(), "try-it");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).expect("read"),
+        "2\n"
+    );
+    assert!(repo.stashes().expect("stashes").is_empty());
 }

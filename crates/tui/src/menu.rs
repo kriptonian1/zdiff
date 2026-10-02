@@ -100,6 +100,8 @@ pub enum Action {
     Commit,
     /// Opens the recent commits.
     History,
+    /// Opens the stashes.
+    Stash,
     /// A line between menu groups; never bound, selected, or run.
     Separator,
 }
@@ -182,6 +184,7 @@ impl Action {
             Self::FocusCommit => "focus_commit",
             Self::Commit => "commit",
             Self::History => "history",
+            Self::Stash => "stash",
             Self::Separator => "separator",
         }
     }
@@ -249,6 +252,7 @@ impl Action {
             Self::FocusCommit => "Write commit message",
             Self::Commit => "Commit",
             Self::History => "History…",
+            Self::Stash => "Stash…",
             Self::Separator => "",
         }
     }
@@ -301,7 +305,7 @@ pub const MENUS: [(&str, &[Action]); 5] = [
             Action::Bottom,
         ],
     ),
-    ("Git", &[Action::History]),
+    ("Git", &[Action::History, Action::Stash]),
     (
         "Settings",
         &[

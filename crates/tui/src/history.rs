@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use ratatui::layout::Rect;
-use zdiff_core::{Commit, GraphRow, layout};
+use zdiff_core::{Commit, GraphRow, StashOp, StashPush, layout};
 
 use crate::app::{DiffView, FileEntry};
 use crate::input::Field;
@@ -19,6 +19,14 @@ const PREFETCH: usize = 20;
 /// Commits a search loads, page by page, while it has too few matches to fill the list.
 // ponytail: matches only what's loaded; walk further on demand if 2000 is too few.
 pub const SEARCH_LIMIT: usize = 2000;
+
+/// What the popup lists: the commit history or the stashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Kind {
+    #[default]
+    Log,
+    Stash,
+}
 
 /// Which list in the popup takes the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,7 +57,33 @@ pub enum Want {
     },
     /// Show the working tree again.
     Back,
+    /// The stashes, as commits.
+    Stashes,
+    /// Apply, pop or drop the stash `commit`.
+    Stash { op: StashOp, commit: Commit },
+    /// Stash the current changes.
+    StashPush(StashPush),
+    /// A new branch `name` from the stash `commit`.
+    StashBranch { commit: Commit, name: String },
 }
+
+/// A question the hint row asks before a stash action.
+#[derive(Debug)]
+pub enum Ask {
+    /// Drop the stash with this id?
+    Drop(String),
+    /// The stash form; `focus` 0 is the message, 1 to 3 the toggles.
+    Push {
+        message: Field,
+        flags: StashPush,
+        focus: u8,
+    },
+    /// The name for a branch from the stash with this id.
+    Branch { id: String, name: Field },
+}
+
+/// The push form's toggles, as `Button::Toggle` numbers them.
+const TOGGLES: [(u8, &str); 3] = [(1, "untracked"), (2, "keep staged"), (3, "staged only")];
 
 /// What a hint-row button or its key does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,44 +94,16 @@ pub enum Button {
     Worktree,
     Copy,
     Back,
-}
-
-impl Button {
-    /// `[y copy hash]`, as the hint row draws it.
-    pub fn label(self, pane: Pane) -> &'static str {
-        match (self, pane) {
-            (Self::Search, _) => "[/ search]",
-            (Self::Enter, Pane::Commits) => "[↵ files]",
-            (Self::Enter, _) => "[↵ preview]",
-            (Self::Open, _) => "[o open]",
-            (Self::Worktree, _) => "[w vs worktree]",
-            (Self::Copy, _) => "[y copy hash]",
-            (Self::Back, Pane::Commits) => "[esc close]",
-            (Self::Back, _) => "[esc back]",
-        }
-    }
-
-    /// The buttons for `pane`, in the order they're drawn.
-    pub fn shown(pane: Pane) -> &'static [Self] {
-        match pane {
-            Pane::Commits => &[
-                Self::Search,
-                Self::Enter,
-                Self::Open,
-                Self::Worktree,
-                Self::Copy,
-                Self::Back,
-            ],
-            Pane::Files => &[
-                Self::Enter,
-                Self::Open,
-                Self::Worktree,
-                Self::Copy,
-                Self::Back,
-            ],
-            Pane::Preview => &[Self::Open, Self::Worktree, Self::Copy, Self::Back],
-        }
-    }
+    Apply,
+    Pop,
+    Drop,
+    Stash,
+    Branch,
+    /// Answers the open [`Ask`].
+    Confirm,
+    Cancel,
+    /// Flips one of the push form's toggles, numbered as in [`TOGGLES`].
+    Toggle(u8),
 }
 
 /// What pressing a button (or its key) asks of the app.
@@ -113,6 +119,7 @@ pub struct Reply {
 /// The open history popup.
 #[derive(Debug, Default)]
 pub struct History {
+    pub kind: Kind,
     pub commits: Vec<Commit>,
     pub rows: Vec<GraphRow>,
     /// How many commits were asked for; fewer back means the history ended.
@@ -136,6 +143,10 @@ pub struct History {
     /// The search box, while there is a search; `typing` while keys go into it.
     pub search: Option<Field>,
     pub typing: bool,
+    /// The question the hint row asks, for a stash action.
+    pub ask: Option<Ask>,
+    /// The commit HEAD points to, to tell whether a stash's base moved.
+    pub head: Option<String>,
     /// Indices of the commits the search matches, all of them without one.
     pub shown: Vec<usize>,
     /// The popup, its lists, and the preview's rows from the last draw, for the mouse.
@@ -152,19 +163,110 @@ pub struct History {
 
 impl History {
     /// A popup waiting for its first page.
-    pub fn new() -> (Self, Want) {
+    pub fn new(kind: Kind) -> (Self, Want) {
         let history = Self {
+            kind,
             limit: PAGE,
             ..Self::default()
         };
-        (history, Want::Commits(PAGE))
+        let want = match kind {
+            Kind::Log => Want::Commits(PAGE),
+            Kind::Stash => Want::Stashes,
+        };
+        (history, want)
+    }
+
+    /// The hint row's buttons, in the order they're drawn.
+    pub fn buttons(&self) -> &'static [Button] {
+        use Button::{
+            Apply, Back, Branch, Cancel, Confirm, Copy, Drop, Enter, Open, Pop, Search, Stash,
+            Toggle, Worktree,
+        };
+        match (&self.ask, self.kind, self.pane) {
+            (Some(Ask::Push { .. }), ..) => &[Confirm, Cancel, Toggle(1), Toggle(2), Toggle(3)],
+            (Some(_), ..) => &[Confirm, Cancel],
+            (None, Kind::Log, Pane::Commits) => &[Search, Enter, Open, Worktree, Copy, Back],
+            (None, Kind::Log, Pane::Files) => &[Enter, Open, Worktree, Copy, Back],
+            (None, Kind::Log, Pane::Preview) => &[Open, Worktree, Copy, Back],
+            (None, Kind::Stash, Pane::Commits) => &[
+                Search, Enter, Open, Apply, Pop, Drop, Stash, Branch, Copy, Back,
+            ],
+            (None, Kind::Stash, Pane::Files) => &[Enter, Open, Apply, Pop, Stash, Copy, Back],
+            (None, Kind::Stash, Pane::Preview) => &[Open, Apply, Pop, Stash, Copy, Back],
+        }
+    }
+
+    /// `[y copy hash]`, as the hint row draws `button`.
+    pub fn label(&self, button: Button) -> String {
+        let label = match (button, self.pane, &self.ask) {
+            (Button::Search, ..) => "[/ search]",
+            (Button::Enter, Pane::Commits, _) => "[↵ files]",
+            (Button::Enter, ..) => "[↵ preview]",
+            (Button::Open, ..) => "[o open]",
+            (Button::Worktree, ..) => "[w vs worktree]",
+            (Button::Copy, ..) => "[y copy hash]",
+            (Button::Back, Pane::Commits, _) => "[esc close]",
+            (Button::Back, ..) => "[esc back]",
+            (Button::Apply, ..) => "[a apply]",
+            (Button::Pop, ..) => "[p pop]",
+            (Button::Drop, ..) => "[d drop]",
+            (Button::Stash, ..) => "[s stash]",
+            (Button::Branch, ..) => "[b branch]",
+            (Button::Confirm, _, Some(Ask::Push { .. })) => "[↵ stash]",
+            (Button::Confirm, _, Some(Ask::Branch { .. })) => "[↵ create]",
+            (Button::Confirm, ..) => "[y drop]",
+            (Button::Cancel, ..) => "[esc cancel]",
+            (Button::Toggle(n), _, Some(Ask::Push { flags, .. })) => {
+                let name = TOGGLES.iter().find(|t| t.0 == n).map_or("", |t| t.1);
+                let mark = if checked(flags, n) { "✓" } else { " " };
+                return format!("[{mark} {name}]");
+            }
+            (Button::Toggle(_), ..) => "",
+        };
+        label.to_owned()
+    }
+
+    /// The text field of an open push form or branch name.
+    pub fn ask_field(&mut self) -> Option<&mut Field> {
+        match &mut self.ask {
+            Some(Ask::Push {
+                message, focus: 0, ..
+            }) => Some(message),
+            Some(Ask::Branch { name, .. }) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Moves the push form's focus between the message and its toggles.
+    pub fn ask_focus(&mut self, forward: bool) -> bool {
+        let Some(Ask::Push { focus, .. }) = &mut self.ask else {
+            return false;
+        };
+        let count = u8::try_from(TOGGLES.len()).unwrap_or(u8::MAX) + 1;
+        *focus = if forward {
+            (*focus + 1) % count
+        } else {
+            (*focus + count - 1) % count
+        };
+        true
+    }
+
+    /// The toggle the push form's focus is on.
+    pub fn focused_toggle(&self) -> Option<u8> {
+        match &self.ask {
+            Some(Ask::Push { focus, .. }) if *focus > 0 => Some(*focus),
+            _ => None,
+        }
     }
 
     /// Takes a newly loaded list; asks for the selected commit's files if they aren't loaded,
     /// and for more commits if a search has too few matches.
     pub fn loaded(&mut self, commits: Vec<Commit>) -> Vec<Want> {
-        self.done = commits.len() < self.limit;
-        self.rows = layout(&commits, MAX_LANES);
+        // Stashes come all at once, so there's never a next page.
+        self.done = self.kind == Kind::Stash || commits.len() < self.limit;
+        if self.kind == Kind::Log {
+            self.rows = layout(&commits, MAX_LANES);
+        }
         self.commits = commits;
         self.selected = self.selected.min(self.commits.len().saturating_sub(1));
         self.filter()
@@ -226,6 +328,10 @@ impl History {
     fn select(&mut self, commit: usize) {
         self.selected = commit;
         (self.preview, self.preview_of, self.large) = (None, None, false);
+        // The push form doesn't depend on the selection; the other questions do.
+        if !matches!(self.ask, Some(Ask::Push { .. })) {
+            self.ask = None;
+        }
     }
 
     fn next_page(&mut self) -> Want {
@@ -404,6 +510,71 @@ impl History {
                 reply.copy = self.selected_commit().map(|c| c.id.clone());
                 reply.redraw = reply.copy.is_some();
             }
+            Button::Apply | Button::Pop => {
+                let op = if button == Button::Pop {
+                    StashOp::Pop
+                } else {
+                    StashOp::Apply
+                };
+                reply.wants.extend(self.stash(op));
+                reply.redraw = !reply.wants.is_empty();
+            }
+            Button::Drop | Button::Branch => {
+                let stash = self.selected_commit().filter(|_| self.kind == Kind::Stash);
+                let id = stash.map(|c| c.id.clone());
+                self.ask = id.map(|id| match button {
+                    Button::Drop => Ask::Drop(id),
+                    _ => Ask::Branch {
+                        id,
+                        name: Field::single(""),
+                    },
+                });
+                reply.redraw = self.ask.is_some();
+            }
+            Button::Stash => {
+                if self.kind == Kind::Stash {
+                    let flags = StashPush {
+                        untracked: true,
+                        ..StashPush::default()
+                    };
+                    self.ask = Some(Ask::Push {
+                        message: Field::single(""),
+                        flags,
+                        focus: 0,
+                    });
+                    self.typing = false;
+                    reply.redraw = true;
+                }
+            }
+            Button::Toggle(n) => {
+                if let Some(Ask::Push { flags, .. }) = &mut self.ask {
+                    let on = !checked(flags, n);
+                    match n {
+                        1 => flags.untracked = on,
+                        2 => flags.keep_index = on,
+                        _ => flags.staged = on,
+                    }
+                    // git refuses `--staged` with the other two.
+                    if on && n == 3 {
+                        (flags.untracked, flags.keep_index) = (false, false);
+                    } else if on {
+                        flags.staged = false;
+                    }
+                    reply.redraw = true;
+                }
+            }
+            Button::Confirm => {
+                reply.wants.extend(self.answer());
+                reply.redraw = true;
+            }
+            Button::Cancel => {
+                self.ask = None;
+                reply.redraw = true;
+            }
+            Button::Back if self.ask.is_some() => {
+                self.ask = None;
+                reply.redraw = true;
+            }
             Button::Back => {
                 reply.redraw = true;
                 if self.typing || self.search.is_some() {
@@ -414,6 +585,40 @@ impl History {
             }
         }
         reply
+    }
+
+    /// What answering the open question asks for, closing it; a blank branch name stays open.
+    fn answer(&mut self) -> Option<Want> {
+        match self.ask.take()? {
+            Ask::Drop(id) => Some(Want::Stash {
+                op: StashOp::Drop,
+                commit: self.commits.iter().find(|c| c.id == id)?.clone(),
+            }),
+            Ask::Push { message, flags, .. } => Some(Want::StashPush(StashPush {
+                message: message.text(),
+                ..flags
+            })),
+            Ask::Branch { id, name } => {
+                let text = name.text().trim().to_owned();
+                if text.is_empty() {
+                    self.ask = Some(Ask::Branch { id, name });
+                    return None;
+                }
+                let commit = self.commits.iter().find(|c| c.id == id)?.clone();
+                Some(Want::StashBranch { commit, name: text })
+            }
+        }
+    }
+
+    /// `op` on the selected stash; nothing in the commit history.
+    fn stash(&self, op: StashOp) -> Option<Want> {
+        let commit = self
+            .selected_commit()
+            .filter(|_| self.kind == Kind::Stash)?;
+        Some(Want::Stash {
+            op,
+            commit: commit.clone(),
+        })
     }
 
     /// Opening the selection: the commit on the chosen file, or its first file.
@@ -435,6 +640,11 @@ impl History {
         })
     }
 
+    /// Whether the selected commit's files are still on their way; never without a commit.
+    pub fn files_loading(&self) -> bool {
+        self.selected_commit().is_some() && !self.files_current()
+    }
+
     /// Whether `files` are the selected commit's.
     fn files_current(&self) -> bool {
         self.files_of.as_deref() == self.selected_commit().map(|c| c.id.as_str())
@@ -449,6 +659,15 @@ impl History {
     }
 }
 
+/// Whether the push flag `Button::Toggle(n)` flips is on.
+fn checked(flags: &StashPush, n: u8) -> bool {
+    match n {
+        1 => flags.untracked,
+        2 => flags.keep_index,
+        _ => flags.staged,
+    }
+}
+
 /// `at + delta` kept inside `0..len`.
 fn clamp_step(at: usize, delta: isize, len: usize) -> usize {
     at.saturating_add_signed(delta).min(len.saturating_sub(1))
@@ -457,14 +676,23 @@ fn clamp_step(at: usize, delta: isize, len: usize) -> usize {
 /// `a1b2c3d^ → a1b2c3d`, `∅ → a1b2c3d` for a root commit, or `a1b2c3d → worktree`, for
 /// the footer.
 pub fn label(commit: &Commit, worktree: bool) -> String {
-    let id = short(&commit.id);
+    let id = stash_name(commit).unwrap_or_else(|| short(&commit.id));
     if worktree {
         format!("{id} → worktree")
+    } else if stash_name(commit).is_some() {
+        id.to_owned()
     } else if commit.parents.is_empty() {
         format!("∅ → {id}")
     } else {
         format!("{id}^ → {id}")
     }
+}
+
+/// `stash@{n}` for a stash listed by [`zdiff_core::Repo::stashes`].
+pub fn stash_name(commit: &Commit) -> Option<&str> {
+    (commit.refs.first())
+        .map(String::as_str)
+        .filter(|_| commit.is_stash())
 }
 
 /// The 7-character id git shows.
@@ -486,6 +714,18 @@ pub(crate) fn commit(id: &str, parents: &[&str]) -> Commit {
     }
 }
 
+/// Two stashes on `base`, `stash@{0}` first.
+#[cfg(test)]
+pub(crate) fn stashes() -> Vec<Commit> {
+    (0..2)
+        .map(|n| {
+            let mut stash = commit(&format!("s{n}"), &["base"]);
+            stash.refs = vec![format!("stash@{{{n}}}")].into();
+            stash
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,7 +742,7 @@ mod tests {
 
     #[test]
     fn moving_asks_for_files_and_the_next_page_near_the_end() {
-        let (mut history, first) = History::new();
+        let (mut history, first) = History::new(Kind::Log);
         assert_eq!(first, Want::Commits(PAGE));
         let want = history.loaded(chain(PAGE));
         assert!(matches!(&want[..], [Want::Files(c)] if c.id == "0000000"));
@@ -525,7 +765,7 @@ mod tests {
 
     #[test]
     fn files_are_kept_only_for_the_selected_commit() {
-        let (mut history, _) = History::new();
+        let (mut history, _) = History::new(Kind::Log);
         history.loaded(chain(3));
         assert!(
             history.files_loaded("0000001", Vec::new()).is_none(),
@@ -578,7 +818,7 @@ mod tests {
             (commit.summary, commit.author) = (summary.into(), author.into());
         }
         commits[2].id = "abc1234ff".into();
-        let (mut history, _) = History::new();
+        let (mut history, _) = History::new(Kind::Log);
         history.loaded(commits);
         history
     }
@@ -624,7 +864,7 @@ mod tests {
 
     #[test]
     fn too_few_matches_load_more_commits_up_to_the_limit() {
-        let (mut history, _) = History::new();
+        let (mut history, _) = History::new(Kind::Log);
         history.loaded(chain(PAGE));
         history.list_area = Rect::new(0, 0, 40, 10);
         let wants = search(&mut history, "0000001");
@@ -675,6 +915,113 @@ mod tests {
         assert_eq!(
             label(&commit("abcdef1234", &["0"]), true),
             "abcdef1 → worktree"
+        );
+    }
+
+    #[test]
+    fn a_stash_list_loads_once_and_drops_only_after_confirming() {
+        let (mut history, first) = History::new(Kind::Stash);
+        assert_eq!(first, Want::Stashes);
+        history.loaded(stashes());
+        assert!(
+            history.done && history.rows.is_empty(),
+            "no pages, no graph"
+        );
+        assert_eq!(label(&history.commits[0], false), "stash@{0}");
+
+        let reply = history.press(Button::Drop, None);
+        assert!(reply.wants.is_empty() && matches!(history.ask, Some(Ask::Drop(_))));
+        assert_eq!(history.buttons(), [Button::Confirm, Button::Cancel]);
+        history.press(Button::Cancel, None);
+        assert!(history.ask.is_none());
+
+        history.press(Button::Drop, None);
+        history.step(1);
+        assert!(history.ask.is_none(), "moving cancels");
+        history.press(Button::Drop, None);
+        let reply = history.press(Button::Confirm, None);
+        assert!(matches!(
+            &reply.wants[..],
+            [Want::Stash { op: StashOp::Drop, commit }] if commit.id == "s1"
+        ));
+        let reply = history.press(Button::Pop, None);
+        assert!(matches!(
+            &reply.wants[..],
+            [Want::Stash {
+                op: StashOp::Pop,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn the_commit_history_has_no_stash_actions() {
+        let (mut history, _) = History::new(Kind::Log);
+        history.loaded(chain(3));
+        assert!(history.press(Button::Pop, None).wants.is_empty());
+        assert!(!history.buttons().contains(&Button::Drop));
+    }
+
+    fn flags(history: &History) -> (bool, bool, bool) {
+        match &history.ask {
+            Some(Ask::Push { flags, .. }) => (flags.untracked, flags.keep_index, flags.staged),
+            _ => panic!("no push form"),
+        }
+    }
+
+    #[test]
+    fn the_push_form_keeps_staged_only_apart_from_the_other_toggles() {
+        let (mut history, _) = History::new(Kind::Stash);
+        history.loaded(Vec::new());
+        history.press(Button::Stash, None);
+        assert_eq!(
+            flags(&history),
+            (true, false, false),
+            "untracked by default"
+        );
+        history.press(Button::Toggle(2), None);
+        history.press(Button::Toggle(3), None);
+        assert_eq!(flags(&history), (false, false, true));
+        history.press(Button::Toggle(1), None);
+        assert_eq!(flags(&history), (true, false, false));
+
+        history.ask_field().expect("message").paste("wip");
+        let reply = history.press(Button::Confirm, None);
+        assert!(matches!(
+            &reply.wants[..],
+            [Want::StashPush(push)] if push.message == "wip" && push.untracked
+        ));
+        assert!(history.ask.is_none());
+    }
+
+    #[test]
+    fn a_branch_needs_a_name_and_moving_cancels_it_but_not_the_push_form() {
+        let (mut history, _) = History::new(Kind::Stash);
+        history.loaded(stashes());
+        history.press(Button::Branch, None);
+        assert!(
+            history.press(Button::Confirm, None).wants.is_empty(),
+            "blank"
+        );
+        assert!(
+            matches!(history.ask, Some(Ask::Branch { .. })),
+            "still asking"
+        );
+        history.ask_field().expect("name").paste("try-it");
+        let reply = history.press(Button::Confirm, None);
+        assert!(matches!(
+            &reply.wants[..],
+            [Want::StashBranch { commit, name }] if commit.id == "s0" && name == "try-it"
+        ));
+
+        history.press(Button::Branch, None);
+        history.step(1);
+        assert!(history.ask.is_none(), "moving cancels a branch");
+        history.press(Button::Stash, None);
+        history.step(-1);
+        assert!(
+            matches!(history.ask, Some(Ask::Push { .. })),
+            "but not the form"
         );
     }
 }

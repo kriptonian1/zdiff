@@ -1,5 +1,5 @@
-//! The history popup: the commit graph and list, the selected commit's details and files,
-//! and a unified preview of the selected file.
+//! The history and stash popup: the commit graph and list, the selected commit's details
+//! and files, and a unified preview of the selected file.
 
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ use zdiff_core::{Cell, Commit, GraphRow};
 use super::diff::{Paint, draw_view};
 use super::{Colors, counts, popup, right_aligned};
 use crate::app::App;
-use crate::history::{Button, History, Pane, short};
+use crate::history::{Ask, Button, History, Kind, Pane, short, stash_name};
 
 /// Terminals at least this wide get the large popup; narrower ones a centred column.
 const WIDE: u16 = 90;
@@ -48,14 +48,20 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         height,
     };
     history.area = area;
-    let block = popup(c).title(" History ");
+    let title = match history.kind {
+        Kind::Log => " History ",
+        Kind::Stash => " Stash ",
+    };
+    let block = popup(c).title(title);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
+    // The push form and branch name need a line for their text above the buttons.
+    let form = matches!(history.ask, Some(Ask::Push { .. } | Ask::Branch { .. }));
     let [main, hint_rule, hint] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(if form { 2 } else { 1 }),
     ])
     .areas(inner);
     frame.render_widget(rule(c, "─", inner.width), hint_rule);
@@ -92,7 +98,8 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_lists(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect, now: i64) {
     let commit = history.selected_commit();
     let message = commit.map_or(0, |c| c.message.lines().count().min(MESSAGE_LINES));
-    let details = u16::try_from(1 + message).unwrap_or(1);
+    let base = usize::from(commit.is_some_and(Commit::is_stash));
+    let details = u16::try_from(1 + base + message).unwrap_or(1);
     // Details and files get at most 40% of the height; the commit list the rest.
     let below = (area.height * 2 / 5).max(details + 2);
     let files = below.saturating_sub(details + 2).max(1);
@@ -109,7 +116,7 @@ fn draw_lists(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect, 
     draw_commits(frame, c, history, list, now);
     history.copy_areas = Default::default();
     if let Some(commit) = history.selected_commit() {
-        let (details, copy) = details_paragraph(c, commit, now);
+        let (details, copy) = details_paragraph(c, (commit, history.head.as_deref()), now);
         frame.render_widget(details, details_area);
         history.copy_areas = copy.map(|(x, width)| {
             Rect::new(details_area.x + x, details_area.y, width, 1).intersection(details_area)
@@ -119,11 +126,31 @@ fn draw_lists(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect, 
 }
 
 /// `[/ search] [↵ files] …` for the current pane, as many as fit; records each for clicks.
+/// A drop waiting for confirmation asks first, in red; the push form and branch name draw
+/// their text on the line above.
 fn draw_buttons(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect) {
     history.buttons.clear();
+    let area = if area.height > 1 {
+        let [text, buttons] = Layout::vertical([Constraint::Length(1); 2]).areas(area);
+        draw_ask_text(frame, c, history, text);
+        buttons
+    } else {
+        area
+    };
     let mut x = area.x + 1;
-    for &button in Button::shown(history.pane) {
-        let label = button.label(history.pane);
+    let asking = matches!(history.ask, Some(Ask::Drop(_))).then(|| history.selected_commit());
+    if let Some(commit) = asking.flatten() {
+        let name = stash_name(commit).unwrap_or_else(|| short(&commit.id));
+        let ask = format!("drop {name} “{}”? ", commit.summary);
+        let room = usize::from(area.width).saturating_sub(24);
+        let ask = fit(&ask, room);
+        let width = u16::try_from(ask.width()).unwrap_or(u16::MAX);
+        frame.render_widget(Line::from(ask).fg(c.red), Rect::new(x, area.y, width, 1));
+        x += width;
+    }
+    let focused = history.focused_toggle();
+    for &button in history.buttons() {
+        let label = history.label(button);
         let width = u16::try_from(label.width()).unwrap_or(u16::MAX);
         if x + width > area.right() {
             break;
@@ -134,9 +161,35 @@ fn draw_buttons(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect
         } else {
             c.accent
         };
-        frame.render_widget(Line::from(label).fg(color), at);
+        let mut line = Line::from(label).fg(color);
+        if focused.is_some_and(|n| button == Button::Toggle(n)) {
+            line = line.underlined();
+        }
+        frame.render_widget(line, at);
         history.buttons.push((at, button));
         x += width + 1;
+    }
+}
+
+/// ` message: text` for the push form, ` new branch from stash@{0}: name` for a branch.
+fn draw_ask_text(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect) {
+    let stash = history
+        .selected_commit()
+        .and_then(stash_name)
+        .unwrap_or("stash");
+    let prompt = match &history.ask {
+        Some(Ask::Branch { .. }) => format!(" new branch from {stash}: "),
+        _ => " message: ".to_owned(),
+    };
+    let width = u16::try_from(prompt.width()).unwrap_or(u16::MAX);
+    let [label, field] =
+        Layout::horizontal([Constraint::Length(width), Constraint::Fill(1)]).areas(area);
+    frame.render_widget(Line::from(prompt).fg(c.accent), label);
+    if let Some(input) = history.ask_field() {
+        input.draw(frame, field, c, true);
+    } else if let Some(Ask::Push { message, .. }) = &mut history.ask {
+        // Focus is on a toggle: the message shows without its cursor.
+        message.draw(frame, field, c, false);
     }
 }
 
@@ -179,7 +232,7 @@ fn draw_preview(
     history.preview_area = body;
     frame.render_widget(rule(c, "─", area.width), line);
     let Some(file) = history.selected_file() else {
-        let text = if history.files.is_empty() {
+        let text = if history.files_loading() {
             " loading…"
         } else {
             ""
@@ -225,10 +278,12 @@ fn draw_commits(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect
     history.list_area = area;
     let height = usize::from(area.height);
     if history.commits.is_empty() {
-        let text = if history.done {
-            " No commits yet"
-        } else {
+        let text = if !history.done {
             " loading…"
+        } else if history.kind == Kind::Stash {
+            " No stashes"
+        } else {
+            " No commits yet"
         };
         frame.render_widget(Line::from(text).fg(c.dim), area);
         return;
@@ -250,7 +305,7 @@ fn draw_commits(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect
     for (y, &i) in (area.y..).zip(rows) {
         let selected = i == history.selected;
         // Lines don't join up across a filtered list, so matches show as plain dots.
-        let graph = query.is_empty().then(|| &history.rows[i]);
+        let graph = history.rows.get(i).filter(|_| query.is_empty());
         let row = (&history.commits[i], graph, query.as_str());
         let mut line = commit_line(c, row, now, area.width, selected && focused);
         if selected {
@@ -292,8 +347,15 @@ fn commit_line(
         Some(graph) => spans.extend(graph_spans(c, graph, commit.head)),
         None => spans.push(if commit.head { "★ " } else { "● " }.fg(c.accent)),
     }
-    spans.push(format!("{} ", short(&commit.id)).fg(c.dim));
-    let names = (commit.refs.iter()).fold(String::new(), |mut names, name| {
+    // A stash leads with its `stash@{n}` instead of the hash, so it isn't repeated as a name.
+    let stash = stash_name(commit);
+    spans.push(format!("{} ", stash.unwrap_or_else(|| short(&commit.id))).fg(c.dim));
+    let refs = if stash.is_some() {
+        &[][..]
+    } else {
+        &commit.refs
+    };
+    let names = (refs.iter()).fold(String::new(), |mut names, name| {
         let _ = write!(names, " ‹{name}›");
         names
     });
@@ -376,9 +438,10 @@ fn graph_spans(c: &Colors, row: &GraphRow, head: bool) -> Vec<Span<'static>> {
 /// `a1b2c3d · Sawan · 5h ago`, then the message.
 /// The details, and where on their first line the hash and the `⧉` that copy it sit, as
 /// `(column, width)`.
+/// A stash adds ` on <base>`, warning when HEAD has moved off it.
 fn details_paragraph(
     c: &Colors,
-    commit: &Commit,
+    (commit, head): (&Commit, Option<&str>),
     now: i64,
 ) -> (Paragraph<'static>, [(u16, u16); 2]) {
     let id = short(&commit.id).to_owned();
@@ -391,6 +454,14 @@ fn details_paragraph(
         about.fg(c.dim),
         "⧉".fg(c.accent),
     ])];
+    if commit.is_stash() {
+        let base = commit.parents.first().map_or("", String::as_str);
+        let mut line = vec![format!(" on {}", short(base)).fg(c.dim)];
+        if head.is_some_and(|head| head != base) {
+            line.push(" · ⚠ HEAD moved since".fg(c.yellow));
+        }
+        lines.push(Line::from(line));
+    }
     lines.extend(
         (commit.message.lines().take(MESSAGE_LINES)).map(|line| Line::from(format!(" {line}"))),
     );
@@ -401,7 +472,14 @@ fn draw_files(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect) 
     history.files_area = area;
     let height = usize::from(area.height);
     if history.files.is_empty() {
-        frame.render_widget(Line::from(" loading…").fg(c.dim), area);
+        let text = if history.files_loading() {
+            " loading…"
+        } else if history.selected_commit().is_some() {
+            " No files"
+        } else {
+            ""
+        };
+        frame.render_widget(Line::from(text).fg(c.dim), area);
         return;
     }
     history.file_scroll = visible_from(history.file_scroll, history.file, height);
@@ -517,7 +595,7 @@ mod tests {
         for (i, c) in commits.iter_mut().enumerate() {
             c.time = now() - 3600 * (i64::try_from(i).unwrap() + 1);
         }
-        let (mut history, _) = History::new();
+        let (mut history, _) = History::new(Kind::Log);
         history.loaded(commits);
         app.history = Some(Box::new(history));
     }
@@ -714,15 +792,12 @@ mod tests {
         open(&mut app);
         render(&mut app, 140, 30);
         let history = app.history.as_ref().expect("open");
-        assert_eq!(history.buttons.len(), Button::shown(Pane::Commits).len());
+        assert_eq!(history.buttons.len(), history.buttons().len());
         assert!(history.copy_areas.iter().all(|area| !area.is_empty()));
         render(&mut app, 50, 30);
         let history = app.history.as_ref().expect("open");
         let fits = history.buttons.len();
-        assert!(
-            fits < Button::shown(Pane::Commits).len(),
-            "dropped from the right"
-        );
+        assert!(fits < history.buttons().len(), "dropped from the right");
         assert!(
             history
                 .buttons
@@ -741,5 +816,92 @@ mod tests {
         assert_eq!(age(100_000_000, 100_000_000 - 800 * 86_400), "2y");
         assert_eq!(fit("short", 10), "short");
         assert_eq!(fit("a longer summary", 8), "a longe…");
+    }
+
+    #[test]
+    fn stashes_lead_with_their_name_and_ask_before_dropping() {
+        let mut app = App::new(Vec::new());
+        let (mut history, _) = History::new(Kind::Stash);
+        history.loaded(crate::history::stashes());
+        app.history = Some(Box::new(history));
+        let screen = render(&mut app, 120, 30);
+        let has = |screen: &[String], text: &str| screen.iter().any(|row| row.contains(text));
+        assert!(
+            has(&screen, " Stash ") && has(&screen, "● stash@{0} commit s0"),
+            "{screen:#?}"
+        );
+        assert!(!has(&screen, "‹stash@"), "not repeated as a name");
+        assert!(has(&screen, "[a apply] [p pop] [d drop]"), "{screen:#?}");
+
+        if let Some(history) = &mut app.history {
+            history.ask = Some(Ask::Drop("s0".into()));
+        }
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            has(&screen, "drop stash@{0} “commit s0”? [y drop] [esc cancel]"),
+            "{screen:#?}"
+        );
+
+        let (mut empty, _) = History::new(Kind::Stash);
+        empty.loaded(Vec::new());
+        app.history = Some(Box::new(empty));
+        assert!(has(&render(&mut app, 120, 30), "No stashes"));
+    }
+
+    #[test]
+    fn the_push_form_and_a_moved_base_draw() {
+        let mut app = App::new(Vec::new());
+        let (mut history, _) = History::new(Kind::Stash);
+        history.loaded(crate::history::stashes());
+        history.head = Some("base".into());
+        app.history = Some(Box::new(history));
+        let has = |screen: &[String], text: &str| screen.iter().any(|row| row.contains(text));
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            has(&screen, " on base") && !has(&screen, "HEAD moved"),
+            "{screen:#?}"
+        );
+
+        if let Some(history) = &mut app.history {
+            history.head = Some("elsewhere".into());
+            history.press(Button::Stash, None);
+        }
+        let screen = render(&mut app, 120, 30);
+        assert!(has(&screen, "on base · ⚠ HEAD moved since"), "{screen:#?}");
+        assert!(has(&screen, " message: "), "{screen:#?}");
+        assert!(
+            has(
+                &screen,
+                "[↵ stash] [esc cancel] [✓ untracked] [  keep staged]"
+            ),
+            "{screen:#?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_or_a_commit_without_files_isnt_loading() {
+        let mut app = App::new(Vec::new());
+        let (mut empty, _) = History::new(Kind::Stash);
+        empty.loaded(Vec::new());
+        app.history = Some(Box::new(empty));
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            !screen.iter().any(|row| row.contains("loading")),
+            "{screen:#?}"
+        );
+
+        let (mut history, _) = History::new(Kind::Log);
+        history.loaded(vec![commit("e000000", &[])]);
+        history.files_loaded("e000000", Vec::new());
+        app.history = Some(Box::new(history));
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            !screen.iter().any(|row| row.contains("loading")),
+            "{screen:#?}"
+        );
+        assert!(
+            screen.iter().any(|row| row.contains("No files")),
+            "{screen:#?}"
+        );
     }
 }

@@ -17,7 +17,7 @@ use zdiff_highlight::{Language, Token};
 use zdiff_search::{Finder, Query};
 
 use crate::find::{self, Find, Toggle};
-use crate::history::{self, Button, History, Pane, Want};
+use crate::history::{self, Ask, Button, History, Kind, Pane, Want};
 use crate::input::{Edit, Field};
 use crate::keymap::{Chord, Context, Keymap};
 use crate::menu::{self, Action, MENUS, Menu};
@@ -635,6 +635,13 @@ impl App {
         if self.history.as_ref().is_some_and(|h| h.typing) {
             return self.history_search_edit(|field| field.paste(text));
         }
+        if self
+            .history
+            .as_mut()
+            .is_some_and(|h| h.ask_field().is_some())
+        {
+            return self.history_ask_edit(|field| field.paste(text));
+        }
         let digits: String;
         let text = if matches!(
             &self.palette,
@@ -938,13 +945,17 @@ impl App {
         true
     }
 
-    /// Opens the history popup and asks for its first page.
-    fn open_history(&mut self) -> bool {
+    /// Opens the history or stash popup and asks for its first page.
+    fn open_history(&mut self, kind: Kind) -> bool {
         if self.patch_mode {
-            self.notice = Some(Notice::Error("a patch has no history".into()));
+            let why = match kind {
+                Kind::Log => "a patch has no history",
+                Kind::Stash => "a patch has no stashes",
+            };
+            self.notice = Some(Notice::Error(why.into()));
             return true;
         }
-        let (history, want) = History::new();
+        let (history, want) = History::new(kind);
         self.history = Some(Box::new(history));
         self.palette = None;
         self.pending_history.push(want);
@@ -959,6 +970,10 @@ impl App {
         if history.typing {
             return self.history_search_key(key);
         }
+        if history.ask.is_some() {
+            return self.history_ask_key(key);
+        }
+        let (stash, commits) = (history.kind == Kind::Stash, history.pane == Pane::Commits);
         let half = page(history.preview_area) / 2;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = page(match history.pane {
@@ -977,6 +992,11 @@ impl App {
             KeyCode::Char('o') => Button::Open,
             KeyCode::Char('w') => Button::Worktree,
             KeyCode::Char('y') => Button::Copy,
+            KeyCode::Char('a') if stash => Button::Apply,
+            KeyCode::Char('p') if stash => Button::Pop,
+            KeyCode::Char('d') if stash && commits => Button::Drop,
+            KeyCode::Char('b') if stash && commits => Button::Branch,
+            KeyCode::Char('s') if stash => Button::Stash,
             code => {
                 let delta = match code {
                     KeyCode::Down | KeyCode::Char('j') => 1,
@@ -993,6 +1013,41 @@ impl App {
             }
         };
         self.history_press(button)
+    }
+
+    /// Keys while the hint row asks: a drop takes `y` or `n`; the push form and branch name
+    /// take text, `Tab` moves between the form's message and toggles, `Space` flips one.
+    fn history_ask_key(&mut self, key: KeyEvent) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
+        let drop = matches!(history.ask, Some(Ask::Drop(_)));
+        let toggle = history.focused_toggle();
+        let button = match key.code {
+            KeyCode::Enter => Button::Confirm,
+            KeyCode::Esc => Button::Cancel,
+            KeyCode::Char('y') if drop => Button::Confirm,
+            KeyCode::Char('n') if drop => Button::Cancel,
+            _ if drop => return false,
+            KeyCode::Tab => return history.ask_focus(true),
+            KeyCode::BackTab => return history.ask_focus(false),
+            KeyCode::Char(' ') if toggle.is_some() => Button::Toggle(toggle.unwrap_or_default()),
+            _ => return self.history_ask_edit(|field| field.key(key)),
+        };
+        self.history_press(button)
+    }
+
+    /// Edits the push form's message or the branch name with `act`.
+    fn history_ask_edit(&mut self, act: impl FnOnce(&mut Field) -> Edit) -> bool {
+        let Some(field) = self.history.as_mut().and_then(|h| h.ask_field()) else {
+            return false;
+        };
+        let edit = act(field);
+        if let Some(text) = field.take_copied() {
+            let label = snippet(&text);
+            self.copy(text, &label);
+        }
+        edit != Edit::Ignored
     }
 
     /// Keys while typing a history search: text goes to the box, arrows still move.
@@ -1048,6 +1103,15 @@ impl App {
 
     /// Does what a hint-row button or its key does.
     fn history_press(&mut self, button: Button) -> bool {
+        // Changing the worktree while a commit is shown would leave the main view stale.
+        let writes = matches!(
+            button,
+            Button::Apply | Button::Pop | Button::Drop | Button::Stash | Button::Branch
+        );
+        if self.viewing.is_some() && writes {
+            self.notice = Some(Notice::Error("back to the worktree first (esc)".into()));
+            return true;
+        }
         let back = match &self.viewing {
             Some(viewing) => viewing.back.clone(),
             None => self.selected_file().map(|f| f.path.clone()),
@@ -1473,7 +1537,8 @@ impl App {
             | Action::SvgPreviewDefault
             | Action::Staging => self.settings_action(action),
             Action::SvgView | Action::ImageCompare => self.picture_action(action),
-            Action::History => self.open_history(),
+            Action::History => self.open_history(Kind::Log),
+            Action::Stash => self.open_history(Kind::Stash),
             Action::Theme => {
                 self.palette = Some(Palette::themes(self.theme));
                 true
@@ -4631,6 +4696,95 @@ mod tests {
     }
 
     /// App with the history popup open on three commits, `c1` selected, drawn once.
+    fn stash_open() -> App {
+        let mut app = app(&["a.rs"]);
+        press(&mut app, KeyCode::Char('Z'));
+        assert_eq!(mem::take(&mut app.pending_history), [Want::Stashes]);
+        app.history_commits(crate::history::stashes());
+        app.pending_history.clear();
+        crate::ui::render(&mut app, 140, 30);
+        app
+    }
+
+    #[test]
+    fn stash_keys_pop_and_drop_after_confirming() {
+        let mut app = stash_open();
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(
+            &app.pending_history[..],
+            [Want::Stash { op: zdiff_core::StashOp::Pop, commit }] if commit.id == "s0"
+        ));
+        app.pending_history.clear();
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.pending_history.is_empty() && app.history.is_some(),
+            "cancelled"
+        );
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(
+            &app.pending_history[..],
+            [Want::Stash {
+                op: zdiff_core::StashOp::Drop,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn stash_actions_wait_until_back_on_the_worktree() {
+        let mut app = stash_open();
+        app.viewing = Some(Viewing {
+            label: "stash@{0}".into(),
+            back: None,
+        });
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.pending_history.is_empty());
+        assert!(matches!(&app.notice, Some(Notice::Error(e)) if e.contains("worktree first")));
+    }
+
+    #[test]
+    fn the_push_form_takes_letters_toggles_with_space_and_pastes() {
+        let mut app = stash_open();
+        press(&mut app, KeyCode::Char('s'));
+        for code in ['y', 's', 'd'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        assert!(app.paste("!"));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.pending_history[..],
+            [Want::StashPush(push)] if push.message == "ysd!" && push.keep_index
+        ));
+
+        app.pending_history.clear();
+        app.viewing = Some(Viewing {
+            label: "stash@{0}".into(),
+            back: None,
+        });
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.pending_history.is_empty());
+        assert!(
+            app.history.as_ref().is_some_and(|h| h.ask.is_none()),
+            "no form"
+        );
+    }
+
+    #[test]
+    fn the_commit_history_ignores_stash_keys() {
+        let mut app = history_open();
+        for code in ['a', 'p', 'd'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        assert!(app.pending_history.is_empty());
+    }
+
     fn history_open() -> App {
         use crate::history::commit;
         let mut app = app(&["a.rs"]);

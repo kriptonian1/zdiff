@@ -122,7 +122,7 @@ impl Repo {
 
     /// The index fresh from disk, so a write never undoes another git's changes; empty in a
     /// new repository, which has no index file until something is staged.
-    fn index(&self) -> Result<gix::index::File, Error> {
+    pub(crate) fn index(&self) -> Result<gix::index::File, Error> {
         let path = self.inner.index_path();
         let index = if path.exists() {
             self.inner.open_index()?

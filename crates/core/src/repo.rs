@@ -23,6 +23,8 @@ pub enum Spec {
     Unstaged,
     /// Two revisions, like `git diff <a> <b>`.
     Revs(String, String),
+    /// What the stash commit with this id holds, untracked files included.
+    Stash(String),
 }
 
 impl Default for Spec {
@@ -39,6 +41,7 @@ impl fmt::Display for Spec {
             Self::Staged(rev) => write!(f, "{rev} → index"),
             Self::Unstaged => f.write_str("index → worktree"),
             Self::Revs(old, new) => write!(f, "{old} → {new}"),
+            Self::Stash(id) => write!(f, "stash {}", id.get(..7).unwrap_or(id)),
         }
     }
 }
@@ -88,7 +91,7 @@ pub struct Change {
     pub path: PathBuf,
     old: Source,
     new: Source,
-    untracked: bool,
+    pub(crate) untracked: bool,
     staged: Staged,
 }
 
@@ -196,6 +199,7 @@ impl Repo {
     /// [`Error::Read`] if a worktree path can't be inspected.
     pub fn changes(&self, spec: &Spec) -> Result<Vec<Change>, Error> {
         let (old, new) = match spec {
+            Spec::Stash(id) => return self.stash_changes(id),
             Spec::Worktree(rev) => (Side::Tree(self.tree(rev)?), Side::Worktree),
             Spec::Staged(rev) => (
                 Side::Tree(self.tree(rev)?),

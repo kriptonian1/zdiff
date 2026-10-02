@@ -34,10 +34,10 @@ use crossterm::event::{
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::{Picker, ProtocolType};
-use zdiff_core::{Repo, Spec};
+use zdiff_core::{Repo, Spec, StashOp};
 
 use anyhow::anyhow;
-use app::{App, Apply, Focus, Notice};
+use app::{App, Apply, Focus, Notice, Toast};
 use settings::Settings;
 use snapshot::{Only, Snapshot, Touched};
 use source::Source;
@@ -447,6 +447,19 @@ fn history_want(
                 true
             })
         }
+        history::Want::Stashes => repo.stashes().map(|stashes| {
+            if let Some(history) = &mut app.history {
+                history.head = repo.head_id();
+            }
+            app.history_commits(stashes);
+            false
+        }),
+        want @ (history::Want::Stash { .. }
+        | history::Want::StashPush(_)
+        | history::Want::StashBranch { .. }) => {
+            stash_want(app, repo, want);
+            return false;
+        }
         history::Want::Back => load(&Spec::default()).map(|files| {
             (*spec, *snapshot) = (Spec::default(), files);
             app.refresh(snapshot.entries());
@@ -458,6 +471,70 @@ fn history_want(
         app.notice = Some(Notice::Error(format!("history: {e}")));
         false
     })
+}
+
+/// Runs a stash command for the popup and reports how it went.
+// ponytail: git runs on the UI thread; a worker and a `Msg` if big repos freeze.
+fn stash_want(app: &mut App, repo: &Repo, want: history::Want) {
+    match want {
+        history::Want::Stash { op, commit } => {
+            let name = history::stash_name(&commit).unwrap_or_default();
+            let done = match op {
+                StashOp::Apply => "applied",
+                StashOp::Pop => "popped",
+                StashOp::Drop => "dropped",
+            };
+            let kept = if op == StashOp::Pop {
+                "; stash kept"
+            } else {
+                ""
+            };
+            let result = repo.stash(op, &commit.id);
+            stash_done(app, (op.as_str(), kept), format!("✓ {done} {name}"), result);
+        }
+        history::Want::StashPush(push) => match repo.stash_push(&push) {
+            Ok(false) => app.toast = Some(Toast::new("nothing to stash".into())),
+            result => stash_done(
+                app,
+                ("push", ""),
+                "✓ stashed".into(),
+                result.map(|_| Vec::new()),
+            ),
+        },
+        history::Want::StashBranch { commit, name } => {
+            let from = history::stash_name(&commit).unwrap_or_default();
+            let result = repo.stash_branch(&commit.id, &name);
+            let done = format!("✓ branch {name} from {from}");
+            stash_done(app, ("branch", "; stash kept"), done, result);
+        }
+        _ => {}
+    }
+}
+
+/// Shows `done` or the conflicts a stash command left, then reloads the list and the
+/// worktree, which may both have changed even when it failed; `kept` follows the conflicts
+/// when git kept the stash.
+fn stash_done(
+    app: &mut App,
+    (cmd, kept): (&str, &str),
+    done: String,
+    result: Result<Vec<PathBuf>, zdiff_core::Error>,
+) {
+    match result {
+        Ok(conflicts) if conflicts.is_empty() => app.toast = Some(Toast::new(done)),
+        Ok(conflicts) => {
+            let paths: Vec<_> = conflicts.iter().map(|p| p.display().to_string()).collect();
+            let why = format!(
+                "{cmd}: {} conflicts ({}){kept}",
+                paths.len(),
+                paths.join(", ")
+            );
+            app.notice = Some(Notice::Error(why));
+        }
+        Err(e) => app.notice = Some(Notice::Error(e.to_string())),
+    }
+    app.pending_history.push(history::Want::Stashes);
+    app.pending_reload = true;
 }
 
 /// `path` without `.` and `..` parts, worked out from the text alone so a deleted file still
@@ -692,6 +769,74 @@ mod tests {
         assert_eq!(
             paths(&app),
             [PathBuf::from("new.txt"), PathBuf::from("wip.txt")]
+        );
+    }
+
+    #[test]
+    fn popping_a_stash_restores_it_and_reloads() {
+        let (dir, mut app, mut source) = one_commit_repo();
+        let out = std::process::Command::new("git")
+            .args(["stash", "push", "-q", "-u"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!dir.path().join("wip.txt").exists(), "stashed away");
+        app.history = Some(Box::new(history::History::new(history::Kind::Stash).0));
+
+        history_want(&mut app, &mut source, history::Want::Stashes, &mut None);
+        let stash = app.history.as_ref().expect("open").commits[0].clone();
+        let pop = history::Want::Stash {
+            op: StashOp::Pop,
+            commit: stash,
+        };
+        history_want(&mut app, &mut source, pop, &mut None);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.text == "✓ popped stash@{0}")
+        );
+        assert!(dir.path().join("wip.txt").exists(), "back on disk");
+        assert!(app.pending_reload);
+        let follow_up = std::mem::take(&mut app.pending_history);
+        assert_eq!(follow_up.last(), Some(&history::Want::Stashes));
+        history_want(&mut app, &mut source, history::Want::Stashes, &mut None);
+        assert!(app.history.as_ref().expect("open").commits.is_empty());
+    }
+
+    #[test]
+    fn stashing_untracked_files_lists_them_in_the_stash() {
+        let (dir, mut app, mut source) = one_commit_repo();
+        app.history = Some(Box::new(history::History::new(history::Kind::Stash).0));
+        let push = zdiff_core::StashPush {
+            untracked: true,
+            ..zdiff_core::StashPush::default()
+        };
+        history_want(
+            &mut app,
+            &mut source,
+            history::Want::StashPush(push),
+            &mut None,
+        );
+        assert!(app.toast.as_ref().is_some_and(|t| t.text == "✓ stashed"));
+        assert!(!dir.path().join("wip.txt").exists(), "stashed away");
+        // The follow-up lists the stash, which asks for its files.
+        while !app.pending_history.is_empty() {
+            for want in std::mem::take(&mut app.pending_history) {
+                history_want(&mut app, &mut source, want, &mut None);
+            }
+        }
+        let history = app.history.as_ref().expect("open");
+        let files: Vec<_> = (history.files.iter())
+            .map(|f| (f.path.clone(), f.status))
+            .collect();
+        assert_eq!(
+            files,
+            [(PathBuf::from("wip.txt"), zdiff_core::Status::Untracked)]
         );
     }
 

@@ -13,6 +13,18 @@ use crate::repo::{Repo, Spec};
 /// Git's empty tree, the old side of a root commit; [`Repo::changes`] knows it without a lookup.
 pub(crate) const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// A commit's whole message and its author's name.
+pub(crate) fn describe(commit: &gix::Commit<'_>) -> (String, String) {
+    let message = (commit.message_raw_sloppy().to_str_lossy())
+        .trim_end()
+        .to_owned();
+    // A malformed signature still lists the commit, without an author.
+    let author = (commit.author())
+        .map(|a| a.name.to_str_lossy().trim().to_owned())
+        .unwrap_or_default();
+    (message, author)
+}
+
 /// Branch and tag names by the commit they point to.
 type Names = HashMap<ObjectId, Vec<String>>;
 
@@ -35,7 +47,21 @@ pub struct Commit {
     pub head: bool,
 }
 
+impl Commit {
+    /// Whether this is a stash from [`Repo::stashes`], whose first name is `stash@{n}`.
+    #[must_use]
+    pub fn is_stash(&self) -> bool {
+        self.refs.first().is_some_and(|r| r.starts_with("stash@"))
+    }
+}
+
 impl Repo {
+    /// The commit HEAD points to, as full hex; `None` before the first commit.
+    #[must_use]
+    pub fn head_id(&self) -> Option<String> {
+        self.inner.head_id().ok().map(|id| id.to_string())
+    }
+
     /// Up to `limit` commits reachable from HEAD and the local branches, newest first.
     ///
     /// # Errors
@@ -56,16 +82,7 @@ impl Repo {
         let mut commits = Vec::with_capacity(limit.min(1024));
         for info in walk.take(limit) {
             let info = info?;
-            let commit = info.object()?;
-            let message = commit
-                .message_raw_sloppy()
-                .to_str_lossy()
-                .trim_end()
-                .to_owned();
-            // A malformed signature still lists the commit, without an author.
-            let author = (commit.author())
-                .map(|a| a.name.to_str_lossy().trim().to_owned())
-                .unwrap_or_default();
+            let (message, author) = describe(&info.object()?);
             commits.push(Commit {
                 id: info.id.to_string(),
                 summary: message.lines().next().unwrap_or_default().to_owned(),
@@ -81,9 +98,13 @@ impl Repo {
     }
 
     /// The two sides that show `commit`: its first parent against it, or the empty tree for a
-    /// root. Merges show what they brought in over their first parent, like `--first-parent`.
+    /// root. Merges show what they brought in over their first parent, like `--first-parent`;
+    /// a stash shows what it saved.
     #[must_use]
     pub fn commit_spec(&self, commit: &Commit) -> Spec {
+        if commit.is_stash() {
+            return Spec::Stash(commit.id.clone());
+        }
         let parent = commit.parents.first().map_or(EMPTY_TREE, String::as_str);
         Spec::Revs(parent.to_owned(), commit.id.clone())
     }
