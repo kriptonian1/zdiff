@@ -8,22 +8,22 @@ class Zdiff < Formula
   on_macos do
     on_arm do
       url "https://github.com/kriptonian1/zdiff/releases/download/v#{version}/zdiff-aarch64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "70a469b80ca264fe90aaaaa4b6f958bcb81e56850cfd359d830e61247da988e9"
     end
     on_intel do
       url "https://github.com/kriptonian1/zdiff/releases/download/v#{version}/zdiff-x86_64-apple-darwin.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "880c1929d438b37e7fb49a71fa99c6095621aae05a32c1fc867da161d0b61965"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/kriptonian1/zdiff/releases/download/v#{version}/zdiff-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "04f3fbf111c69104d1e93f57c57203dbb7f6911c336d7f14cdfd76dff3808cf1"
     end
     on_intel do
       url "https://github.com/kriptonian1/zdiff/releases/download/v#{version}/zdiff-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "f3834841f77ff86db3ae5ad359ac5b307dc66132e6578e7cc09e43bde0fa3025"
     end
   end
 
