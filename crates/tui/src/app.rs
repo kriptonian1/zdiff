@@ -915,9 +915,7 @@ impl App {
         if render.is_some() && self.fonts.is_none() && preview::needs_fonts(&view.file) {
             // ponytail: about 50–200 ms on the UI thread, once per run; load on a thread if
             // anyone notices the pause.
-            let mut fonts = Database::new();
-            fonts.load_system_fonts();
-            self.fonts = Some(Arc::new(fonts));
+            self.fonts = Some(Arc::new(preview::system_fonts()));
         }
         view.preview = Preview::svg(&view.file, render, max_px, self.fonts.as_ref());
     }

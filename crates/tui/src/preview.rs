@@ -9,7 +9,7 @@ use flate2::read::GzDecoder;
 use image::{ImageReader, RgbaImage, imageops};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use resvg::usvg::fontdb::Database;
+use resvg::usvg::fontdb::{Database, Family};
 use resvg::{tiny_skia, usvg};
 use zdiff_core::FileDiff;
 
@@ -308,6 +308,56 @@ fn svg_picture(
         image,
         pixels,
     }))
+}
+
+/// The installed fonts, with `serif`, `sans-serif` and `monospace` on installed families.
+pub fn system_fonts() -> Database {
+    let mut fonts = Database::new();
+    fonts.load_system_fonts();
+    point_generics(&mut fonts);
+    fonts
+}
+
+/// Points each generic family whose default is missing at an installed one.
+fn point_generics(fonts: &mut Database) {
+    type Set = fn(&mut Database, String);
+    // fontdb defaults to Windows and macOS names, which Linux rarely has.
+    let generics: [(Family, &[&str], Set); 3] = [
+        (
+            Family::Serif,
+            &["DejaVu Serif", "Liberation Serif", "Noto Serif"],
+            Database::set_serif_family::<String>,
+        ),
+        (
+            Family::SansSerif,
+            &["DejaVu Sans", "Liberation Sans", "Noto Sans"],
+            Database::set_sans_serif_family::<String>,
+        ),
+        (
+            Family::Monospace,
+            &["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono"],
+            Database::set_monospace_family::<String>,
+        ),
+    ];
+    for (generic, candidates, set) in generics {
+        let installed =
+            |name: &str| (fonts.faces()).any(|f| f.families.iter().any(|(n, _)| n == name));
+        if installed(fonts.family_name(&generic)) {
+            continue;
+        }
+        let pick = (candidates
+            .iter()
+            .find(|c| installed(c))
+            .map(|c| (*c).to_owned()))
+        .or_else(|| {
+            fonts
+                .faces()
+                .find_map(|f| Some(f.families.first()?.0.clone()))
+        });
+        if let Some(name) = pick {
+            set(fonts, name);
+        }
+    }
 }
 
 /// Whether drawing `file` needs fonts: it has `<text>`, or is an `.svgz` that can't be read.
@@ -640,6 +690,20 @@ mod tests {
             eprintln!("no system fonts here; text rendering not checked");
             return;
         }
+        // Without fontdb's default families, as on most Linux systems.
+        let defaults = ["Arial", "Times New Roman", "Courier New"];
+        let ids: Vec<_> = (fonts.faces())
+            .filter(|f| {
+                f.families
+                    .iter()
+                    .any(|(n, _)| defaults.contains(&n.as_str()))
+            })
+            .map(|f| f.id)
+            .collect();
+        for id in ids {
+            fonts.remove_face(id);
+        }
+        point_generics(&mut fonts);
         assert!(inked(Some(&Arc::new(fonts))));
     }
 
