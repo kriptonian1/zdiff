@@ -1,4 +1,5 @@
 mod app;
+mod branches;
 mod clipboard;
 mod find;
 mod history;
@@ -15,6 +16,7 @@ mod stream;
 mod text;
 mod tree;
 mod ui;
+mod usage;
 mod watch;
 
 use std::fmt::Write as _;
@@ -38,6 +40,7 @@ use zdiff_core::{Repo, Spec, StashOp};
 
 use anyhow::anyhow;
 use app::{App, Apply, Focus, Notice, Toast};
+use branches::GRAPH;
 use settings::Settings;
 use snapshot::{Only, Snapshot, Touched};
 use source::Source;
@@ -77,6 +80,8 @@ pub enum Msg {
     SearchDone {
         generation: u64,
     },
+    /// A new sample of our own memory and CPU.
+    Usage(usage::Usage),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -182,6 +187,7 @@ fn main() -> anyhow::Result<()> {
             .and_then(Result::ok)
             .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
         spawn_input(tx.clone());
+        usage::spawn(tx.clone());
         let result = event_loop(terminal, app, (&mut source, config.as_deref()), (&tx, &rx));
         if enhanced {
             execute!(io::stdout(), PopKeyboardEnhancementFlags)?;
@@ -251,6 +257,10 @@ fn event_loop(
         };
         dirty = match message {
             Ok(Msg::Term(event)) => app.handle(&event?),
+            Ok(Msg::Usage(usage)) => {
+                app.usage = Some(usage);
+                app.show_usage
+            }
             // The watcher compares against the working tree, not the commit being viewed.
             Ok(Msg::Refreshed { .. }) if app.viewing.is_some() => false,
             Ok(Msg::Refreshed {
@@ -400,10 +410,28 @@ fn history_want(
     // ponytail: log, file lists and counts run on the UI thread; use a worker if big
     // commits or long histories stall input.
     let result = match want {
-        history::Want::Commits(limit) => repo.log(limit).map(|commits| {
-            app.history_commits(commits);
+        history::Want::Commits(limit) => {
+            // A history opened from the branches popup walks only from that branch.
+            let from = app.history.as_ref().and_then(|h| h.from.clone());
+            let commits = match from {
+                Some((_, tip)) => repo.log_from(&[tip], limit),
+                None => repo.log(limit),
+            };
+            commits.map(|commits| {
+                app.history_commits(commits);
+                false
+            })
+        }
+        history::Want::Branches => repo.branches().map(|list| {
+            app.branches_loaded(list);
             false
         }),
+        history::Want::Graph(tip) => {
+            (repo.log_from(&[tip.clone(), "HEAD".into()], GRAPH)).map(|commits| {
+                app.branch_graph(&tip, commits);
+                false
+            })
+        }
         history::Want::Files(commit) => load(&repo.commit_spec(&commit)).map(|snapshot| {
             app.history_files(&commit.id, snapshot.entries());
             *files = Some((commit.id.clone(), snapshot));
@@ -454,18 +482,17 @@ fn history_want(
             app.history_commits(stashes);
             false
         }),
-        want @ (history::Want::Stash { .. }
-        | history::Want::StashPush(_)
-        | history::Want::StashBranch { .. }) => {
-            stash_want(app, repo, want);
-            return false;
-        }
         history::Want::Back => load(&Spec::default()).map(|files| {
             (*spec, *snapshot) = (Spec::default(), files);
             app.refresh(snapshot.entries());
             app.viewing_closed();
             true
         }),
+        // The stash and branch actions, which run the git CLI.
+        git => {
+            git_want(app, repo, git);
+            Ok(false)
+        }
     };
     result.unwrap_or_else(|e| {
         app.notice = Some(Notice::Error(format!("history: {e}")));
@@ -473,9 +500,10 @@ fn history_want(
     })
 }
 
-/// Runs a stash command for the popup and reports how it went.
+/// Runs a stash or branch command for its popup and reports how it went.
 // ponytail: git runs on the UI thread; a worker and a `Msg` if big repos freeze.
-fn stash_want(app: &mut App, repo: &Repo, want: history::Want) {
+fn git_want(app: &mut App, repo: &Repo, want: history::Want) {
+    let none = |result: Result<(), zdiff_core::Error>| result.map(|()| Vec::new());
     match want {
         history::Want::Stash { op, commit } => {
             let name = history::stash_name(&commit).unwrap_or_default();
@@ -490,35 +518,73 @@ fn stash_want(app: &mut App, repo: &Repo, want: history::Want) {
                 ""
             };
             let result = repo.stash(op, &commit.id);
-            stash_done(app, (op.as_str(), kept), format!("✓ {done} {name}"), result);
+            let done = format!("✓ {done} {name}");
+            report(
+                app,
+                (op.as_str(), kept),
+                done,
+                result,
+                history::Want::Stashes,
+            );
         }
         history::Want::StashPush(push) => match repo.stash_push(&push) {
             Ok(false) => app.toast = Some(Toast::new("nothing to stash".into())),
-            result => stash_done(
+            result => report(
                 app,
                 ("push", ""),
                 "✓ stashed".into(),
                 result.map(|_| Vec::new()),
+                history::Want::Stashes,
             ),
         },
         history::Want::StashBranch { commit, name } => {
             let from = history::stash_name(&commit).unwrap_or_default();
             let result = repo.stash_branch(&commit.id, &name);
             let done = format!("✓ branch {name} from {from}");
-            stash_done(app, ("branch", "; stash kept"), done, result);
+            report(
+                app,
+                ("branch", "; stash kept"),
+                done,
+                result,
+                history::Want::Stashes,
+            );
         }
+        history::Want::Checkout(branch) => {
+            let done = format!("✓ switched to {}", branch.name);
+            let result = none(repo.checkout(&branch));
+            report(app, ("switch", ""), done, result, history::Want::Branches);
+        }
+        history::Want::NewBranch { name, from } => {
+            let done = format!("✓ created and switched to {name}");
+            let result = none(repo.create_branch(&name, &from));
+            report(app, ("switch", ""), done, result, history::Want::Branches);
+        }
+        history::Want::DeleteBranch { name, force } => match repo.delete_branch(&name, force) {
+            // Unmerged: ask again before forcing.
+            Ok(false) => {
+                if let Some(branches) = &mut app.branches {
+                    branches.ask = Some(branches::Ask::Delete { name, force: true });
+                }
+            }
+            result => {
+                let done = format!("✓ deleted {name}");
+                let result = result.map(|_| Vec::new());
+                report(app, ("branch", ""), done, result, history::Want::Branches);
+            }
+        },
         _ => {}
     }
 }
 
-/// Shows `done` or the conflicts a stash command left, then reloads the list and the
-/// worktree, which may both have changed even when it failed; `kept` follows the conflicts
-/// when git kept the stash.
-fn stash_done(
+/// Shows `done` or the conflicts a git command left, then asks for `then` to reload the open
+/// list, and reloads the worktree, since both may have changed even when it failed; `kept`
+/// follows the conflicts when git kept the stash.
+fn report(
     app: &mut App,
     (cmd, kept): (&str, &str),
     done: String,
     result: Result<Vec<PathBuf>, zdiff_core::Error>,
+    then: history::Want,
 ) {
     match result {
         Ok(conflicts) if conflicts.is_empty() => app.toast = Some(Toast::new(done)),
@@ -533,7 +599,7 @@ fn stash_done(
         }
         Err(e) => app.notice = Some(Notice::Error(e.to_string())),
     }
-    app.pending_history.push(history::Want::Stashes);
+    app.pending_history.push(then);
     app.pending_reload = true;
 }
 
@@ -837,6 +903,121 @@ mod tests {
         assert_eq!(
             files,
             [(PathBuf::from("wip.txt"), zdiff_core::Status::Untracked)]
+        );
+    }
+
+    #[test]
+    fn a_branch_graph_and_its_history_walk_from_that_branch() {
+        let (dir, mut app, mut source) = one_commit_repo();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["switch", "-q", "-c", "side"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "side work"]);
+        git(&["switch", "-q", "-"]);
+
+        app.branches = Some(Box::new(branches::Branches::new().0));
+        history_want(&mut app, &mut source, history::Want::Branches, &mut None);
+        let branches = app.branches.as_ref().expect("open");
+        let names: Vec<_> = branches.list.iter().map(|b| b.name.as_str()).collect();
+        assert!(names.contains(&"side"), "{names:?}");
+        for want in std::mem::take(&mut app.pending_history) {
+            history_want(&mut app, &mut source, want, &mut None);
+        }
+        assert!(
+            !app.branches.as_ref().expect("open").graph.is_empty(),
+            "graph loaded"
+        );
+
+        let side = (app.branches.as_ref().expect("open").list.iter())
+            .find(|b| b.name == "side")
+            .expect("side")
+            .clone();
+        let mut history = history::History::new(history::Kind::Log).0;
+        history.from = Some((side.name, side.tip));
+        app.history = Some(Box::new(history));
+        history_want(&mut app, &mut source, history::Want::Commits(10), &mut None);
+        let summaries: Vec<_> = (app.history.as_ref().expect("open").commits.iter())
+            .map(|c| c.summary.clone())
+            .collect();
+        assert_eq!(summaries, ["side work", "add old"]);
+    }
+
+    #[test]
+    fn branch_actions_switch_and_ask_again_before_forcing_a_delete() {
+        let (dir, mut app, mut source) = one_commit_repo();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["switch", "-q", "-c", "side"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "side work"]);
+        git(&["switch", "-q", "-"]);
+        app.branches = Some(Box::new(branches::Branches::new().0));
+        history_want(&mut app, &mut source, history::Want::Branches, &mut None);
+        let side = (app.branches.as_ref().expect("open").list.iter())
+            .find(|b| b.name == "side")
+            .expect("side")
+            .clone();
+
+        app.pending_history.clear();
+        history_want(
+            &mut app,
+            &mut source,
+            history::Want::Checkout(side),
+            &mut None,
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.text == "✓ switched to side")
+        );
+        assert!(app.pending_reload);
+        assert_eq!(app.pending_history, [history::Want::Branches]);
+        let Source::Repo { repo, .. } = &source else {
+            unreachable!()
+        };
+        assert_eq!(repo.head_name(), "side");
+
+        git(&["switch", "-q", "-"]);
+        let delete = |force| history::Want::DeleteBranch {
+            name: "side".into(),
+            force,
+        };
+        history_want(&mut app, &mut source, delete(false), &mut None);
+        let asks = app.branches.as_ref().and_then(|b| b.ask.as_ref());
+        assert!(
+            matches!(asks, Some(branches::Ask::Delete { force: true, .. })),
+            "{asks:?}"
+        );
+        history_want(&mut app, &mut source, delete(true), &mut None);
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.text == "✓ deleted side")
         );
     }
 

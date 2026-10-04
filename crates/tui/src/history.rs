@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use ratatui::layout::Rect;
-use zdiff_core::{Commit, GraphRow, StashOp, StashPush, layout};
+use zdiff_core::{Branch, Commit, GraphRow, StashOp, StashPush, layout};
 
 use crate::app::{DiffView, FileEntry};
 use crate::input::Field;
@@ -57,6 +57,16 @@ pub enum Want {
     },
     /// Show the working tree again.
     Back,
+    /// The branches and tags, for the branches popup.
+    Branches,
+    /// The graph of the branch at this tip against HEAD.
+    Graph(String),
+    /// Switch to this branch or tag.
+    Checkout(Branch),
+    /// A new branch `name` at the commit `from`, checked out.
+    NewBranch { name: String, from: String },
+    /// Delete the local branch `name`, even unmerged with `force`.
+    DeleteBranch { name: String, force: bool },
     /// The stashes, as commits.
     Stashes,
     /// Apply, pop or drop the stash `commit`.
@@ -120,6 +130,9 @@ pub struct Reply {
 #[derive(Debug, Default)]
 pub struct History {
     pub kind: Kind,
+    /// The branch name and tip the list walks from, opened from the branches popup; `None`
+    /// walks from every local branch.
+    pub from: Option<(String, String)>,
     pub commits: Vec<Commit>,
     pub rows: Vec<GraphRow>,
     /// How many commits were asked for; fewer back means the history ended.
@@ -280,14 +293,7 @@ impl History {
     /// Whether `commit` matches `query`: summary or author containing it, or an id starting
     /// with it. Lowercase queries ignore case.
     fn matches(commit: &Commit, query: &str) -> bool {
-        let fold = !query.chars().any(char::is_uppercase);
-        let has = |text: &str| {
-            if fold {
-                text.to_lowercase().contains(query)
-            } else {
-                text.contains(query)
-            }
-        };
+        let has = |text: &str| contains(text, query);
         commit.id.starts_with(&query.to_lowercase()) || has(&commit.summary) || has(&commit.author)
     }
 
@@ -665,6 +671,15 @@ fn checked(flags: &StashPush, n: u8) -> bool {
         1 => flags.untracked,
         2 => flags.keep_index,
         _ => flags.staged,
+    }
+}
+
+/// Whether `text` contains `query`, ignoring case when the query is all lowercase.
+pub fn contains(text: &str, query: &str) -> bool {
+    if query.chars().any(char::is_uppercase) {
+        text.contains(query)
+    } else {
+        text.to_lowercase().contains(query)
     }
 }
 

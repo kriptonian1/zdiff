@@ -3,6 +3,7 @@
 //! Open a repository with [`Repo::discover`], list what changed for a [`Spec`]
 //! with [`Repo::changes`], then load one file's hunks with [`Repo::diff`].
 
+mod branches;
 mod diff;
 mod graph;
 mod history;
@@ -15,6 +16,7 @@ mod write;
 
 use std::path::PathBuf;
 
+pub use branches::{Branch, COUNT_LIMIT, DETACHED, RefKind, Upstream};
 pub use diff::{FileDiff, Hunk, Text};
 pub use graph::{Cell, GraphRow, layout};
 pub use history::Commit;
@@ -45,8 +47,8 @@ pub enum Error {
     /// Staging or committing was refused; the message says why.
     #[error("{0}")]
     Refused(&'static str),
-    /// A `git stash` command couldn't run or failed; `stderr` is its first line.
-    #[error("git stash {cmd}: {stderr}")]
+    /// A `git` command couldn't run or failed; `stderr` is its first line.
+    #[error("git {cmd}: {stderr}")]
     Command { cmd: &'static str, stderr: String },
     /// Any other git failure (bad revision, corrupt object, status failure).
     #[error(transparent)]

@@ -25,6 +25,7 @@ fn label(item: Action, (read_only, images, patch): (bool, bool, bool)) -> &'stat
     match item {
         Action::History if patch => "History… (patch mode)",
         Action::Stash if patch => "Stash… (patch mode)",
+        Action::Branches if patch => "Branches… (patch mode)",
         Action::Staging if read_only => "Staging (read-only)",
         Action::ImagePreviews if !images => "Image previews (not supported)",
         Action::SvgPreviewDefault if !images => "Open SVGs as preview (not supported)",
@@ -115,13 +116,15 @@ pub(super) fn draw_dropdown(frame: &mut Frame, app: &mut App) {
             Action::Staging => can_stage,
             Action::ImagePreviews => app.image_previews,
             Action::SvgPreviewDefault => app.svg_preview_default,
+            Action::Usage => app.show_usage,
             _ => false,
         };
         let check = if checked { "✓" } else { " " };
         let text = Span::from(format!(" {check} {label}"));
         // Read-only runs can't turn staging on, nor plain terminals draw images: greyed.
         let off = (item == Action::Staging && app.read_only)
-            || (matches!(item, Action::History | Action::Stash) && app.patch_mode)
+            || (matches!(item, Action::History | Action::Stash | Action::Branches)
+                && app.patch_mode)
             || (matches!(item, Action::ImagePreviews | Action::SvgPreviewDefault)
                 && app.images.is_none());
         let line = right_aligned(

@@ -41,7 +41,7 @@ pub struct Commit {
     pub time: i64,
     /// Full hex ids, first parent first; empty for a root commit.
     pub parents: Box<[String]>,
-    /// Short names of the local branches and tags pointing here.
+    /// Short names of the branches (remote ones too) and tags pointing here.
     pub refs: Box<[String]>,
     /// Whether HEAD points here.
     pub head: bool,
@@ -71,9 +71,27 @@ impl Repo {
             // Unborn HEAD: nothing committed yet.
             return Ok(Vec::new());
         };
-        let (refs, branches) = self.ref_names()?;
+        let (_, branches) = self.ref_names()?;
         let mut tips = vec![head];
         tips.extend(branches.into_iter().filter(|id| *id != head));
+        self.walk(tips, limit)
+    }
+
+    /// Up to `limit` commits reachable from `tips` (revisions such as ids or `HEAD`), newest
+    /// first.
+    ///
+    /// # Errors
+    /// Returns [`Error::Git`] if a tip doesn't resolve or a commit can't be read.
+    pub fn log_from(&self, tips: &[String], limit: usize) -> Result<Vec<Commit>, Error> {
+        let tips = (tips.iter())
+            .map(|tip| Ok(self.inner.rev_parse_single(tip.as_str())?.detach()))
+            .collect::<Result<Vec<_>, Error>>()?;
+        self.walk(tips, limit)
+    }
+
+    fn walk(&self, tips: Vec<ObjectId>, limit: usize) -> Result<Vec<Commit>, Error> {
+        let head = self.inner.head_id().ok().map(gix::Id::detach);
+        let (refs, _) = self.ref_names()?;
         // ponytail: each page walks again from the tips, O(total) per page; keep the walk
         // between pages if 50k-commit repos feel slow.
         let walk = (self.inner.rev_walk(tips))
@@ -91,7 +109,7 @@ impl Repo {
                 time: info.commit_time.unwrap_or_default(),
                 parents: info.parent_ids.iter().map(ToString::to_string).collect(),
                 refs: refs.get(&info.id).cloned().unwrap_or_default().into(),
-                head: info.id == head,
+                head: Some(info.id) == head,
             });
         }
         Ok(commits)
@@ -114,7 +132,9 @@ impl Repo {
         let mut names = Names::new();
         let mut branches = Vec::new();
         let platform = self.inner.references()?;
+        // Remote branches are only names to show, never walked from.
         let refs = (platform.local_branches()?.map(|r| (r, true)))
+            .chain(platform.remote_branches()?.map(|r| (r, false)))
             .chain(platform.tags()?.map(|r| (r, false)));
         for (reference, branch) in refs {
             // A broken ref shouldn't hide the history; it's left out.
@@ -122,6 +142,9 @@ impl Repo {
                 continue;
             };
             let name = reference.name().shorten().to_string();
+            if name.ends_with("/HEAD") {
+                continue;
+            }
             if let Ok(id) = reference.peel_to_id() {
                 let id = id.detach();
                 names.entry(id).or_default().push(name);

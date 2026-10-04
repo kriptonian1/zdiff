@@ -94,6 +94,8 @@ pub enum Action {
     SvgView,
     /// Whether SVGs open as pictures; a setting.
     SvgPreviewDefault,
+    /// Shows our memory and CPU in the footer; a setting.
+    Usage,
     /// Moves typing into the commit message box.
     FocusCommit,
     /// Applies the checkboxes, then commits the index with the message.
@@ -102,6 +104,8 @@ pub enum Action {
     History,
     /// Opens the stashes.
     Stash,
+    /// Opens the branches and tags.
+    Branches,
     /// A line between menu groups; never bound, selected, or run.
     Separator,
 }
@@ -181,10 +185,12 @@ impl Action {
             Self::ImageCompare => "image_compare",
             Self::SvgView => "svg_view",
             Self::SvgPreviewDefault => "svg_preview_default",
+            Self::Usage => "usage",
             Self::FocusCommit => "focus_commit",
             Self::Commit => "commit",
             Self::History => "history",
             Self::Stash => "stash",
+            Self::Branches => "branches",
             Self::Separator => "separator",
         }
     }
@@ -249,10 +255,12 @@ impl Action {
             Self::ImageCompare => "Image compare mode",
             Self::SvgView => "Switch SVG code / preview",
             Self::SvgPreviewDefault => "Open SVGs as preview",
+            Self::Usage => "Show resource usage",
             Self::FocusCommit => "Write commit message",
             Self::Commit => "Commit",
             Self::History => "History…",
             Self::Stash => "Stash…",
+            Self::Branches => "Branches…",
             Self::Separator => "",
         }
     }
@@ -305,7 +313,7 @@ pub const MENUS: [(&str, &[Action]); 5] = [
             Action::Bottom,
         ],
     ),
-    ("Git", &[Action::History, Action::Stash]),
+    ("Git", &[Action::History, Action::Branches, Action::Stash]),
     (
         "Settings",
         &[
@@ -316,6 +324,7 @@ pub const MENUS: [(&str, &[Action]); 5] = [
             Action::Separator,
             Action::Syntax,
             Action::WatchAtStart,
+            Action::Usage,
         ],
     ),
 ];

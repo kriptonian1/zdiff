@@ -28,6 +28,7 @@ image = { version = "0.25", default-features = false }
 ratatui-image = { version = "11.1", default-features = false }
 resvg = { version = "0.48", default-features = false }
 flate2 = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

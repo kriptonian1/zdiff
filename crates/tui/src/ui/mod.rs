@@ -1,3 +1,4 @@
+mod branches;
 mod diff;
 mod find;
 mod history;
@@ -55,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     diff::draw(frame, app, diff);
     find::draw(frame, app);
     palette::draw(frame, app);
+    branches::draw(frame, app);
     history::draw(frame, app);
     menu::draw_dropdown(frame, app);
     toast(frame, app);
@@ -126,7 +128,7 @@ fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
     let (files, added, removed) = (app.tree.files()).fold((0, 0, 0), |(n, a, r), (_, e)| {
         (n + 1, a + e.added, r + e.removed)
     });
-    let right = if let Some(notice) = &app.notice {
+    let mut right = if let Some(notice) = &app.notice {
         let (text, color) = match notice {
             Notice::Error(text) => (text, c.red),
             Notice::Done(text) => (text, c.green),
@@ -137,6 +139,19 @@ fn footer(frame: &mut Frame, app: &mut App, area: Rect) {
         right.extend(counts(c, added, removed));
         right
     };
+    // Our memory and CPU go last, and are the first thing left out when the footer is full.
+    if let Some(usage) = app.usage.filter(|_| app.show_usage) {
+        let color = match usage.cpu_tenths {
+            901.. => c.red,
+            500..=900 => c.yellow,
+            _ => c.dim,
+        };
+        let badge = Span::from(usage.label()).fg(color);
+        let used: usize = left.iter().chain(&right).map(Span::width).sum();
+        if used + badge.width() + 2 <= usize::from(area.width) {
+            right.push(badge);
+        }
+    }
     frame.render_widget(right_aligned(left, right, area.width), area);
 }
 
@@ -219,6 +234,61 @@ mod tests {
 
     use super::*;
     use crate::app::FileEntry;
+
+    #[test]
+    fn footer_ends_with_our_usage_coloured_by_cpu_and_drops_it_first() {
+        use crate::usage::Usage;
+        let entry = FileEntry {
+            path: "a.rs".into(),
+            status: Status::Modified,
+            added: 2,
+            removed: 1,
+            change: 0,
+            staged: zdiff_core::Staged::No,
+        };
+        let mut app = App::new(vec![entry]);
+        (app.repo_name, app.branch) = ("zdiff".into(), "master".into());
+        let footer = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 6)).expect("test backend");
+            terminal.draw(|f| draw(f, app)).expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            let text: String = (0..width).map(|x| buffer[(x, 5)].symbol()).collect();
+            let at = text.find('▮').map(|i| text[..i].chars().count());
+            let color = at.map(|x| buffer[(u16::try_from(x).unwrap_or(0), 5)].fg);
+            (text, color)
+        };
+        assert!(!footer(&mut app, 100).0.contains('▮'), "no sample yet");
+
+        app.usage = Some(Usage {
+            mb: 24,
+            cpu_tenths: 4,
+        });
+        let (text, color) = footer(&mut app, 100);
+        assert!(
+            text.trim_end().ends_with("+2 -1 ▮ 24 MB · 0.4% CPU"),
+            "{text:?}"
+        );
+        assert!(text.contains("1 files"), "counts stay: {text:?}");
+        assert_eq!(color, Some(DARK.dim));
+        app.usage = Some(Usage {
+            mb: 24,
+            cpu_tenths: 600,
+        });
+        assert_eq!(footer(&mut app, 100).1, Some(DARK.yellow));
+        app.usage = Some(Usage {
+            mb: 24,
+            cpu_tenths: 950,
+        });
+        assert_eq!(footer(&mut app, 100).1, Some(DARK.red));
+
+        let (narrow, _) = footer(&mut app, 50);
+        assert!(
+            !narrow.contains('▮') && narrow.contains("1 files"),
+            "{narrow:?}"
+        );
+        app.show_usage = false;
+        assert!(!footer(&mut app, 100).0.contains('▮'), "turned off");
+    }
 
     #[test]
     fn footer_shows_repo_branch_compare_and_totals() {

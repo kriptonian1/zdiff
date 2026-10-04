@@ -39,6 +39,8 @@ pub struct General {
     pub images: bool,
     /// SVGs open as rendered pictures instead of code.
     pub svg_preview: bool,
+    /// The footer badge with our own memory and CPU.
+    pub usage: bool,
     pub theme: Theme,
 }
 
@@ -50,6 +52,7 @@ impl Default for General {
             staging: true,
             images: true,
             svg_preview: false,
+            usage: true,
             theme: Theme::default(),
         }
     }
@@ -159,6 +162,7 @@ mod tests {
                 staging: false,
                 images: false,
                 svg_preview: true,
+                usage: false,
                 theme: Theme::GithubLight,
             },
             layout: Some(Layout {

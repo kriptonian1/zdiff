@@ -16,11 +16,12 @@ use super::diff::{Paint, draw_view};
 use super::{Colors, counts, popup, right_aligned};
 use crate::app::App;
 use crate::history::{Ask, Button, History, Kind, Pane, short, stash_name};
+use crate::input::Field;
 
 /// Terminals at least this wide get the large popup; narrower ones a centred column.
-const WIDE: u16 = 90;
+pub(super) const WIDE: u16 = 90;
 /// Width of the popup on narrow terminals.
-const NARROW_WIDTH: u16 = 40;
+pub(super) const NARROW_WIDTH: u16 = 40;
 /// Columns of summary kept before a commit's names are dropped, then before its age is.
 const NAMES_KEEP: usize = 24;
 const AGE_KEEP: usize = 12;
@@ -33,24 +34,12 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     let Some(history) = &mut app.history else {
         return;
     };
-    let screen = frame.area();
-    let wide = screen.width >= WIDE;
-    let width = if wide {
-        screen.width * 9 / 10
-    } else {
-        NARROW_WIDTH.min(screen.width)
-    };
-    let height = screen.height * 9 / 10;
-    let area = Rect {
-        x: screen.x + (screen.width - width) / 2,
-        y: screen.y + (screen.height - height) / 2,
-        width,
-        height,
-    };
+    let (area, wide) = popup_area(frame.area());
     history.area = area;
-    let title = match history.kind {
-        Kind::Log => " History ",
-        Kind::Stash => " Stash ",
+    let title = match (history.kind, &history.from) {
+        (Kind::Log, Some((name, _))) => format!(" History · {name} "),
+        (Kind::Log, None) => " History ".to_owned(),
+        (Kind::Stash, _) => " Stash ".to_owned(),
     };
     let block = popup(c).title(title);
     let inner = block.inner(area);
@@ -67,9 +56,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(rule(c, "─", inner.width), hint_rule);
     draw_buttons(frame, c, history, hint);
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let now = now();
     // Narrow popups have no room beside the lists, so an open preview takes the whole popup.
     if !wide {
         if history.pane == Pane::Preview {
@@ -92,6 +79,32 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(bar), line);
     draw_lists(frame, c, history, left, now);
     draw_preview(frame, (c, paint), history, right);
+}
+
+/// The time now in seconds since the Unix epoch, for ages.
+pub(super) fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Where the history and branches popups go: 90% of a wide screen, or a centred narrow
+/// column; `true` when wide.
+pub(super) fn popup_area(screen: Rect) -> (Rect, bool) {
+    let wide = screen.width >= WIDE;
+    let width = if wide {
+        screen.width * 9 / 10
+    } else {
+        NARROW_WIDTH.min(screen.width)
+    };
+    let height = screen.height * 9 / 10;
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    (area, wide)
 }
 
 /// The commit list, the selected commit's details, and its files.
@@ -199,6 +212,19 @@ fn draw_search(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect)
     let total = history.commits.len();
     let more = if history.done { "" } else { "+" };
     let count = format!(" {} of {total}{more} ", history.shown.len());
+    if let Some(input) = &mut history.search {
+        history.clear_area = search_row(frame, c, (input, history.typing), &count, area);
+    }
+}
+
+/// ` / text   count  ✕` in `area`; returns where the `✕` that clears it is.
+pub(super) fn search_row(
+    frame: &mut Frame,
+    c: &Colors,
+    (input, typing): (&mut Field, bool),
+    count: &str,
+    area: Rect,
+) -> Rect {
     let count_width = u16::try_from(count.width()).unwrap_or(u16::MAX);
     let [slash, field, counter, clear] = Layout::horizontal([
         Constraint::Length(3),
@@ -208,12 +234,10 @@ fn draw_search(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect)
     ])
     .areas(area);
     frame.render_widget(Line::from(" / ").fg(c.accent), slash);
-    if let Some(input) = &mut history.search {
-        input.draw(frame, field, c, history.typing);
-    }
-    frame.render_widget(Line::from(count).fg(c.dim), counter);
+    input.draw(frame, field, c, typing);
+    frame.render_widget(Line::from(count.to_owned()).fg(c.dim), counter);
     frame.render_widget(Line::from(" ✕ ").fg(c.dim), clear);
-    history.clear_area = clear;
+    clear
 }
 
 /// The selected file's path and counts, then its unified diff.
@@ -261,7 +285,7 @@ fn draw_preview(
 }
 
 /// A full-width line of `ch`, dimmed.
-fn rule(c: &Colors, ch: &str, width: u16) -> Line<'static> {
+pub(super) fn rule(c: &Colors, ch: &str, width: u16) -> Line<'static> {
     Line::from(ch.repeat(usize::from(width))).fg(c.dim)
 }
 
@@ -331,7 +355,7 @@ fn draw_commits(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect
 }
 
 /// One commit: graph, short id, summary, then its age and names on the right.
-fn commit_line(
+pub(super) fn commit_line(
     c: &Colors,
     (commit, graph, query): (&Commit, Option<&GraphRow>, &str),
     now: i64,
@@ -520,7 +544,7 @@ fn draw_files(frame: &mut Frame, c: &Colors, history: &mut History, area: Rect) 
 }
 
 /// The first row to draw so `selected` stays in a `height`-row window that starts at `top`.
-fn visible_from(top: usize, selected: usize, height: usize) -> usize {
+pub(super) fn visible_from(top: usize, selected: usize, height: usize) -> usize {
     if selected < top {
         selected
     } else if height > 0 && selected >= top + height {
@@ -545,7 +569,7 @@ pub(super) fn age(now: i64, time: i64) -> String {
 }
 
 /// `text` cut to `width` columns, ending in `…` when cut.
-fn fit(text: &str, width: usize) -> String {
+pub(super) fn fit(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_owned();
     }

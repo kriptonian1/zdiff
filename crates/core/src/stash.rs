@@ -91,8 +91,12 @@ impl Repo {
     /// run or fails for another reason, such as local changes in the way.
     pub fn stash(&self, op: StashOp, id: &str) -> Result<Vec<PathBuf>, Error> {
         let name = self.stash_ref(id)?;
-        let cmd = op.as_str();
-        let output = self.git_stash(cmd, &[&name])?;
+        let cmd = match op {
+            StashOp::Apply => "stash apply",
+            StashOp::Pop => "stash pop",
+            StashOp::Drop => "stash drop",
+        };
+        let output = self.git(cmd, &["stash", op.as_str(), &name])?;
         self.finish(cmd, &output, op != StashOp::Drop)
     }
 
@@ -109,13 +113,14 @@ impl Repo {
             (push.keep_index, "--keep-index"),
             (push.staged, "--staged"),
         ];
-        let mut args: Vec<&str> = (flags.iter()).filter(|f| f.0).map(|f| f.1).collect();
+        let mut args = vec!["stash", "push"];
+        args.extend((flags.iter()).filter(|f| f.0).map(|f| f.1));
         let message = push.message.trim();
         if !message.is_empty() {
             args.extend(["-m", message]);
         }
-        let output = self.git_stash("push", &args)?;
-        self.finish("push", &output, false)?;
+        let output = self.git("stash push", &args)?;
+        self.finish("stash push", &output, false)?;
         // git exits 0 with "No local changes to save", so the list says whether it stashed.
         Ok(top(self)? != before)
     }
@@ -127,13 +132,10 @@ impl Repo {
     /// Returns [`Error::Refused`] for a blank name or one starting with `-`, or if the stash is
     /// gone, and [`Error::Command`] if git refuses, such as for a name already taken.
     pub fn stash_branch(&self, id: &str, name: &str) -> Result<Vec<PathBuf>, Error> {
-        let name = name.trim();
-        if name.is_empty() || name.starts_with('-') {
-            return Err(Error::Refused("branch name can't be blank or start with -"));
-        }
+        let name = check_name(name)?;
         let stash = self.stash_ref(id)?;
-        let output = self.git_stash("branch", &[name, &stash])?;
-        self.finish("branch", &output, true)
+        let output = self.git("stash branch", &["stash", "branch", name, &stash])?;
+        self.finish("stash branch", &output, true)
     }
 
     /// What a stash holds: its base against it, plus the untracked files it saved, which git
@@ -168,12 +170,11 @@ impl Repo {
         Ok(format!("stash@{{{n}}}"))
     }
 
-    /// Runs `git stash <cmd> <args>` in the worktree.
-    fn git_stash(&self, cmd: &'static str, args: &[&str]) -> Result<Output, Error> {
+    /// Runs `git <args>` in the worktree; `cmd` names it in errors, such as `stash pop`.
+    pub(crate) fn git(&self, cmd: &'static str, args: &[&str]) -> Result<Output, Error> {
         Command::new("git")
             .arg("-C")
             .arg(&self.workdir)
-            .args(["stash", cmd])
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
@@ -190,7 +191,7 @@ impl Repo {
 
     /// The conflicted paths a failed command left when `merges` (it applies a stash), else
     /// its first line of stderr as the error.
-    fn finish(
+    pub(crate) fn finish(
         &self,
         cmd: &'static str,
         output: &Output,
@@ -225,4 +226,14 @@ impl Repo {
         paths.dedup();
         Ok(paths)
     }
+}
+
+/// A branch name typed by the user, trimmed; refused when blank or starting with `-`, so git
+/// never reads it as an option.
+pub(crate) fn check_name(name: &str) -> Result<&str, Error> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('-') {
+        return Err(Error::Refused("branch name can't be blank or start with -"));
+    }
+    Ok(name)
 }

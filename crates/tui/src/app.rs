@@ -12,10 +12,11 @@ use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use resvg::usvg::fontdb::Database;
 use serde::{Deserialize, Serialize};
-use zdiff_core::{Commit, Error, FileDiff, Row, Side, Staged, Status, Text, WordChanges};
+use zdiff_core::{Commit, Error, FileDiff, RefKind, Row, Side, Staged, Status, Text, WordChanges};
 use zdiff_highlight::{Language, Token};
 use zdiff_search::{Finder, Query};
 
+use crate::branches::{self, Branches};
 use crate::find::{self, Find, Toggle};
 use crate::history::{self, Ask, Button, History, Kind, Pane, Want};
 use crate::input::{Edit, Field};
@@ -300,6 +301,8 @@ pub struct App {
     pub only: Option<String>,
     /// The history popup while it is open.
     pub history: Option<Box<History>>,
+    /// The branches popup while it is open; history opened from it draws on top.
+    pub branches: Option<Box<Branches>>,
     /// History work for the event loop, which holds the repository.
     pub pending_history: Vec<Want>,
     /// The commit the main view shows instead of the working tree.
@@ -314,6 +317,10 @@ pub struct App {
     pub images: Option<Picker>,
     /// Whether changed images are drawn as pictures; a setting.
     pub image_previews: bool,
+    /// Whether the footer shows our memory and CPU; a setting.
+    pub show_usage: bool,
+    /// The latest sample of our memory and CPU, once one has arrived.
+    pub usage: Option<crate::usage::Usage>,
     /// How a changed image's sides are compared, and the swipe or onion percent.
     pub image_compare: Compare,
     pub mix: u8,
@@ -402,6 +409,7 @@ impl App {
             quit: false,
             only: None,
             history: None,
+            branches: None,
             pending_history: Vec::new(),
             viewing: None,
             back_button: Rect::default(),
@@ -409,6 +417,8 @@ impl App {
             toast: None,
             images: None,
             image_previews: true,
+            show_usage: true,
+            usage: None,
             image_compare: Compare::default(),
             mix: 50,
             compare_tabs: [Rect::default(); 3],
@@ -642,6 +652,17 @@ impl App {
         {
             return self.history_ask_edit(|field| field.paste(text));
         }
+        if self.history.is_none()
+            && self
+                .branches
+                .as_mut()
+                .is_some_and(|b| b.ask_field().is_some())
+        {
+            return self.branches_ask_edit(|field| field.paste(text));
+        }
+        if self.history.is_none() && self.branches.as_ref().is_some_and(|b| b.typing) {
+            return self.branches_search_edit(|field| field.paste(text));
+        }
         let digits: String;
         let text = if matches!(
             &self.palette,
@@ -736,6 +757,7 @@ impl App {
                 self.image_previews = !self.image_previews;
                 self.reload_preview();
             }
+            Action::Usage => self.show_usage = !self.show_usage,
             Action::SvgPreviewDefault => {
                 self.svg_preview_default = !self.svg_preview_default;
                 let view = svg_view_for(self.svg_preview_default);
@@ -960,6 +982,280 @@ impl App {
         self.palette = None;
         self.pending_history.push(want);
         true
+    }
+
+    /// Opens the branches popup and asks for its list.
+    fn open_branches(&mut self) -> bool {
+        if self.patch_mode {
+            self.notice = Some(Notice::Error("a patch has no branches".into()));
+            return true;
+        }
+        let (branches, want) = Branches::new();
+        self.branches = Some(Box::new(branches));
+        self.palette = None;
+        self.pending_history.push(want);
+        true
+    }
+
+    /// Opens the history popup over the branches, walking only from the selected branch.
+    fn open_branch_history(&mut self) -> bool {
+        let Some(branch) = self.branches.as_ref().and_then(|b| b.selected_branch()) else {
+            return false;
+        };
+        let (mut history, want) = History::new(Kind::Log);
+        history.from = Some((branch.name.clone(), branch.tip.clone()));
+        self.history = Some(Box::new(history));
+        self.pending_history.push(want);
+        true
+    }
+
+    /// Keys while the branches popup is open and nothing covers it.
+    fn branches_key(&mut self, key: KeyEvent) -> bool {
+        let Some(branches) = &mut self.branches else {
+            return false;
+        };
+        if branches.ask.is_some() {
+            return self.branches_ask_key(key);
+        }
+        if branches.typing {
+            match key.code {
+                KeyCode::Esc => {
+                    (branches.search, branches.typing) = (None, false);
+                    let wants = branches.filter();
+                    self.pending_history.extend(wants);
+                    return true;
+                }
+                KeyCode::Enter => {
+                    branches.typing = false;
+                    return true;
+                }
+                KeyCode::Up | KeyCode::Down => {}
+                _ => return self.branches_search_edit(|field| field.key(key)),
+            }
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let list = page(branches.list_area);
+        let graph = page(branches.graph_area);
+        let delta = match key.code {
+            KeyCode::Char('d') if ctrl => return branches.scroll_graph(graph / 2),
+            KeyCode::Char('u') if ctrl => return branches.scroll_graph(-graph / 2),
+            KeyCode::Char(']') => return branches.scroll_graph(graph),
+            KeyCode::Char('[') => return branches.scroll_graph(-graph),
+            KeyCode::Enter => return self.open_branch_history(),
+            KeyCode::Char('/') => {
+                branches.search.get_or_insert_with(Field::default);
+                return !mem::replace(&mut branches.typing, true);
+            }
+            KeyCode::Char(code @ ('c' | 'n' | 'd')) => return self.branch_action(code),
+            KeyCode::Char('r') => {
+                let wants = branches.toggle_remotes();
+                self.pending_history.extend(wants);
+                return true;
+            }
+            KeyCode::Char('y') => {
+                let Some(name) = branches.selected_branch().map(|b| b.name.clone()) else {
+                    return false;
+                };
+                self.copy(name.clone(), &name);
+                return true;
+            }
+            KeyCode::Esc if branches.search.is_some() => {
+                branches.search = None;
+                let wants = branches.filter();
+                self.pending_history.extend(wants);
+                return true;
+            }
+            KeyCode::Esc => {
+                self.branches = None;
+                return true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::Up | KeyCode::Char('k') => -1,
+            KeyCode::PageDown => list,
+            KeyCode::PageUp => -list,
+            KeyCode::Home | KeyCode::Char('g') => isize::MIN / 2,
+            KeyCode::End | KeyCode::Char('G') => isize::MAX / 2,
+            _ => return false,
+        };
+        let (moved, wants) = branches.step(delta);
+        self.pending_history.extend(wants);
+        moved
+    }
+
+    /// `c` checks out the selected branch, `n` asks for a new one's name, `d` asks before
+    /// deleting it; each refuses what it can't do with a notice.
+    fn branch_action(&mut self, code: char) -> bool {
+        let Some(branches) = &mut self.branches else {
+            return false;
+        };
+        let Some(branch) = branches.selected_branch().cloned() else {
+            return false;
+        };
+        let refused = if self.viewing.is_some() {
+            Some("back to the worktree first (esc)".to_owned())
+        } else {
+            match code {
+                'c' if branch.head => Some(format!("already on {}", branch.name)),
+                'd' if branch.head => Some("can't delete the branch you're on".into()),
+                'd' if branch.kind != RefKind::Local => {
+                    Some("only local branches can be deleted here".into())
+                }
+                _ => None,
+            }
+        };
+        if let Some(why) = refused {
+            self.notice = Some(Notice::Error(why));
+            return true;
+        }
+        match code {
+            'c' => self.pending_history.push(Want::Checkout(branch)),
+            'n' => {
+                branches.ask = Some(branches::Ask::New {
+                    name: Box::new(Field::single("")),
+                });
+            }
+            _ => {
+                branches.ask = Some(branches::Ask::Delete {
+                    name: branch.name,
+                    force: false,
+                });
+            }
+        }
+        true
+    }
+
+    /// Keys while the branches hint line asks: a delete takes `y` or `n`, a new branch's name
+    /// takes text; `Enter` confirms and `Esc` cancels both.
+    fn branches_ask_key(&mut self, key: KeyEvent) -> bool {
+        let Some(branches) = &mut self.branches else {
+            return false;
+        };
+        let delete = matches!(branches.ask, Some(branches::Ask::Delete { .. }));
+        match key.code {
+            KeyCode::Enter => {}
+            KeyCode::Char('y') if delete => {}
+            KeyCode::Esc => {
+                branches.ask = None;
+                return true;
+            }
+            KeyCode::Char('n') if delete => {
+                branches.ask = None;
+                return true;
+            }
+            _ if delete => return false,
+            _ => return self.branches_ask_edit(|field| field.key(key)),
+        }
+        let want = branches.answer();
+        self.pending_history.extend(want);
+        true
+    }
+
+    /// Edits the new branch's name with `act`.
+    fn branches_ask_edit(&mut self, act: impl FnOnce(&mut Field) -> Edit) -> bool {
+        let Some(field) = self.branches.as_mut().and_then(|b| b.ask_field()) else {
+            return false;
+        };
+        let edit = act(field);
+        if let Some(text) = field.take_copied() {
+            let label = snippet(&text);
+            self.copy(text, &label);
+        }
+        edit != Edit::Ignored
+    }
+
+    /// Edits the branches search with `act`, filtering again when the text changed.
+    fn branches_search_edit(&mut self, act: impl FnOnce(&mut Field) -> Edit) -> bool {
+        let Some(branches) = &mut self.branches else {
+            return false;
+        };
+        let Some(field) = &mut branches.search else {
+            return false;
+        };
+        let edit = act(field);
+        let copied = field.take_copied();
+        if edit == Edit::Changed {
+            let wants = branches.filter();
+            self.pending_history.extend(wants);
+        }
+        if let Some(text) = copied {
+            let label = snippet(&text);
+            self.copy(text, &label);
+        }
+        edit != Edit::Ignored
+    }
+
+    /// Mouse over the branches popup: a click selects, a second click on the selected branch
+    /// opens its history, the wheel moves the list or scrolls the graph; a click outside closes.
+    fn branches_mouse(&mut self, kind: MouseEventKind, position: Position) -> bool {
+        let Some(branches) = &mut self.branches else {
+            return false;
+        };
+        let wheel = match kind {
+            MouseEventKind::ScrollDown => WHEEL_STEP,
+            MouseEventKind::ScrollUp => -WHEEL_STEP,
+            MouseEventKind::Down(MouseButton::Left) => 0,
+            _ => return false,
+        };
+        if wheel != 0 {
+            if branches.graph_area.contains(position) {
+                return branches.scroll_graph(wheel);
+            }
+            let (moved, wants) = branches.step(wheel);
+            self.pending_history.extend(wants);
+            return moved;
+        }
+        if !branches.area.contains(position) {
+            self.branches = None;
+            return true;
+        }
+        // Clicks elsewhere still select: a delete then cancels, a new branch follows.
+        if branches.ask.is_some() && branches.ask_buttons[0].contains(position) {
+            let want = branches.answer();
+            self.pending_history.extend(want);
+            return true;
+        }
+        if branches.ask.is_some() && branches.ask_buttons[1].contains(position) {
+            branches.ask = None;
+            return true;
+        }
+        if branches.clear_area.contains(position) {
+            (branches.search, branches.typing) = (None, false);
+            let wants = branches.filter();
+            self.pending_history.extend(wants);
+            return true;
+        }
+        if branches.search_area.contains(position) {
+            branches.search.get_or_insert_with(Field::default);
+            return !mem::replace(&mut branches.typing, true);
+        }
+        branches.typing = false;
+        if !branches.list_area.contains(position) {
+            return true;
+        }
+        let row = branches.scroll + usize::from(position.y - branches.list_area.y);
+        let Some(branches::Line::Branch(i)) = branches.lines().get(row).copied() else {
+            return true;
+        };
+        if i == branches.selected {
+            return self.open_branch_history();
+        }
+        let wants = branches.select(i);
+        self.pending_history.extend(wants);
+        true
+    }
+
+    /// The branches popup's list arrived.
+    pub fn branches_loaded(&mut self, list: Vec<zdiff_core::Branch>) {
+        if let Some(branches) = &mut self.branches {
+            self.pending_history.extend(branches.loaded(list));
+        }
+    }
+
+    /// The graph for the branch at `tip` arrived.
+    pub fn branch_graph(&mut self, tip: &str, commits: Vec<Commit>) {
+        if let Some(branches) = &mut self.branches {
+            branches.graph_loaded(tip, commits);
+        }
     }
 
     /// Keys while the history popup is open; it takes them all, like the open menu.
@@ -1255,7 +1551,7 @@ impl App {
         file: Option<&Path>,
         back: Option<PathBuf>,
     ) {
-        self.history = None;
+        (self.history, self.branches) = (None, None);
         self.viewing = Some(Viewing {
             label: history::label(commit, worktree),
             back,
@@ -1284,7 +1580,8 @@ impl App {
         let popup = self.palette.is_some()
             || self.menu.open.is_some()
             || self.find.is_some()
-            || self.history.is_some();
+            || self.history.is_some()
+            || self.branches.is_some();
         !popup
             && self.stream.is_none()
             && matches!(&self.diff, DiffPane::Loaded(view)
@@ -1415,6 +1712,9 @@ impl App {
         if self.history.is_some() {
             return self.history_key(key);
         }
+        if self.branches.is_some() {
+            return self.branches_key(key);
+        }
         let typing = self.palette.is_some() || self.find.is_some() || self.writing;
         if let Some(redraw) = self.field_key(key) {
             return redraw;
@@ -1535,10 +1835,12 @@ impl App {
             | Action::WatchAtStart
             | Action::ImagePreviews
             | Action::SvgPreviewDefault
+            | Action::Usage
             | Action::Staging => self.settings_action(action),
             Action::SvgView | Action::ImageCompare => self.picture_action(action),
             Action::History => self.open_history(Kind::Log),
             Action::Stash => self.open_history(Kind::Stash),
+            Action::Branches => self.open_branches(),
             Action::Theme => {
                 self.palette = Some(Palette::themes(self.theme));
                 true
@@ -1628,6 +1930,7 @@ impl App {
         self.syntax = settings.general.syntax;
         self.image_previews = settings.general.images;
         self.svg_preview_default = settings.general.svg_preview;
+        self.show_usage = settings.general.usage;
         self.svg_view = svg_view_for(self.svg_preview_default);
         self.staging = settings.general.staging;
         self.watch_default = settings.general.watch;
@@ -1649,6 +1952,7 @@ impl App {
                 staging: self.staging,
                 images: self.image_previews,
                 svg_preview: self.svg_preview_default,
+                usage: self.show_usage,
                 watch: self.watch_default,
                 theme: self.theme,
             },
@@ -2142,7 +2446,10 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) -> bool {
         let position = Position::new(mouse.column, mouse.row);
         let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
-        let over = self.menu.open.is_some() || self.palette.is_some() || self.history.is_some();
+        let over = self.menu.open.is_some()
+            || self.palette.is_some()
+            || self.history.is_some()
+            || self.branches.is_some();
         if click && !over && self.commit_box.contains(position) {
             return !mem::replace(&mut self.writing, true);
         }
@@ -2184,6 +2491,9 @@ impl App {
         }
         if self.history.is_some() {
             return self.history_mouse(mouse.kind, position);
+        }
+        if self.branches.is_some() {
+            return self.branches_mouse(mouse.kind, position);
         }
         if click && self.viewing.is_some() && self.back_button.contains(position) {
             self.pending_history.push(Want::Back);
@@ -4696,6 +5006,110 @@ mod tests {
     }
 
     /// App with the history popup open on three commits, `c1` selected, drawn once.
+    #[test]
+    fn branches_open_a_filtered_history_and_esc_steps_back() {
+        let mut app = app(&["a.rs"]);
+        press(&mut app, KeyCode::Char('B'));
+        assert_eq!(mem::take(&mut app.pending_history), [Want::Branches]);
+        app.branches_loaded(crate::branches::sample());
+        assert_eq!(
+            mem::take(&mut app.pending_history),
+            [Want::Graph("master-tip".into())]
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            mem::take(&mut app.pending_history),
+            [Want::Graph("origin/master-tip".into())]
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            mem::take(&mut app.pending_history),
+            [Want::Commits(history::PAGE)]
+        );
+        let from = app.history.as_ref().and_then(|h| h.from.clone());
+        assert_eq!(
+            from,
+            Some(("origin/master".into(), "origin/master-tip".into()))
+        );
+
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.history.is_none() && app.branches.is_some(),
+            "back to the list"
+        );
+        assert_eq!(
+            app.branches.as_ref().map(|b| b.selected),
+            Some(2),
+            "same selection"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.branches.is_none());
+
+        app.patch_mode = true;
+        press(&mut app, KeyCode::Char('B'));
+        assert!(app.branches.is_none());
+        assert!(matches!(&app.notice, Some(Notice::Error(e)) if e.contains("no branches")));
+    }
+
+    #[test]
+    fn branch_keys_check_out_create_and_delete_with_guards() {
+        let mut app = app(&["a.rs"]);
+        press(&mut app, KeyCode::Char('B'));
+        app.branches_loaded(crate::branches::sample());
+        app.pending_history.clear();
+        let notice = |app: &App, text: &str| matches!(&app.notice, Some(Notice::Error(e)) if e.contains(text));
+
+        press(&mut app, KeyCode::Char('c'));
+        assert!(notice(&app, "already on master") && app.pending_history.is_empty());
+        press(&mut app, KeyCode::Char('d'));
+        assert!(notice(&app, "the branch you're on"));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(notice(&app, "only local branches"), "a remote");
+        app.pending_history.clear();
+
+        press(&mut app, KeyCode::Char('n'));
+        for code in ['y', 'n', 'd'] {
+            press(&mut app, KeyCode::Char(code));
+        }
+        assert!(app.paste("!"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.pending_history,
+            [Want::NewBranch {
+                name: "ynd!".into(),
+                from: "origin/master-tip".into()
+            }]
+        );
+        app.pending_history.clear();
+
+        press(&mut app, KeyCode::Char('g'));
+        app.pending_history.clear();
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(&app.pending_history[..], [Want::Checkout(b)] if b.name == "feat"));
+        app.pending_history.clear();
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.pending_history.is_empty(), "cancelled");
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            app.pending_history,
+            [Want::DeleteBranch {
+                name: "feat".into(),
+                force: false
+            }]
+        );
+
+        app.pending_history.clear();
+        app.viewing = Some(Viewing {
+            label: "a1b2c3d^ → a1b2c3d".into(),
+            back: None,
+        });
+        press(&mut app, KeyCode::Char('c'));
+        assert!(notice(&app, "worktree first") && app.pending_history.is_empty());
+    }
+
     fn stash_open() -> App {
         let mut app = app(&["a.rs"]);
         press(&mut app, KeyCode::Char('Z'));
@@ -4976,6 +5390,20 @@ mod tests {
 
         let mut text = diff_app();
         assert!(!press(&mut text, KeyCode::Char('o')), "not an image");
+    }
+
+    #[test]
+    fn the_usage_badge_is_a_saved_setting() {
+        let mut app = App::new(Vec::new());
+        assert!(
+            app.show_usage && app.settings().general.usage,
+            "on by default"
+        );
+        assert!(app.run(Action::Usage));
+        assert!(!app.show_usage && app.pending_save && !app.settings().general.usage);
+        let mut fresh = App::new(Vec::new());
+        fresh.apply(app.settings());
+        assert!(!fresh.show_usage, "round-trips");
     }
 
     #[test]

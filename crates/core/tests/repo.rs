@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use zdiff_core::{Change, Error, Hunk, Patch, Repo, Spec, Staged, StashOp, StashPush, Status};
+use zdiff_core::{
+    Change, Error, Hunk, Patch, RefKind, Repo, Spec, Staged, StashOp, StashPush, Status,
+};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -743,7 +745,13 @@ fn local_changes_in_the_way_are_a_command_error() {
         .stash(StashOp::Apply, &stashes[0].id)
         .expect_err("refused by git");
     assert!(
-        matches!(error, Error::Command { cmd: "apply", .. }),
+        matches!(
+            error,
+            Error::Command {
+                cmd: "stash apply",
+                ..
+            }
+        ),
         "{error}"
     );
 }
@@ -839,4 +847,190 @@ fn a_branch_from_a_stash_restores_it_and_drops_it() {
         "2\n"
     );
     assert!(repo.stashes().expect("stashes").is_empty());
+}
+
+fn names(repo: &Repo) -> Vec<(String, RefKind, bool)> {
+    let branches = repo.branches().expect("branches");
+    (branches.into_iter())
+        .map(|b| (b.name, b.kind, b.head))
+        .collect()
+}
+
+#[test]
+fn branches_list_locals_then_tags_with_head_marked() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    git(dir.path(), &["branch", "-M", "main"]);
+    git(dir.path(), &["tag", "v0.1"]);
+    git(dir.path(), &["switch", "-q", "-c", "side"]);
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    assert_eq!(
+        names(&repo),
+        [
+            ("main".to_owned(), RefKind::Local, false),
+            ("side".to_owned(), RefKind::Local, true),
+            ("v0.1".to_owned(), RefKind::Tag, false),
+        ]
+    );
+    git(dir.path(), &["switch", "-q", "--detach"]);
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    assert_eq!(
+        names(&repo)[0],
+        ("(detached)".to_owned(), RefKind::Local, true)
+    );
+}
+
+#[test]
+fn upstreams_count_ahead_and_behind_and_notice_when_gone() {
+    let origin = init();
+    fs::write(origin.path().join("a.txt"), "1\n").expect("write");
+    commit(origin.path());
+    git(origin.path(), &["branch", "-M", "main"]);
+    let clone = tempfile::tempdir().expect("temp dir");
+    let from = origin.path().to_str().expect("utf-8 path");
+    git(clone.path(), &["clone", "-q", from, "."]);
+    for n in 2..4 {
+        fs::write(clone.path().join("a.txt"), format!("{n}\n")).expect("write");
+        commit(clone.path());
+    }
+    fs::write(origin.path().join("b.txt"), "theirs\n").expect("write");
+    commit(origin.path());
+    git(clone.path(), &["fetch", "-q"]);
+
+    let repo = Repo::discover(clone.path()).expect("a repo");
+    let branches = repo.branches().expect("branches");
+    let main = &branches[0];
+    assert_eq!((main.name.as_str(), main.kind), ("main", RefKind::Local));
+    let up = main.upstream.as_ref().expect("an upstream");
+    assert_eq!(
+        (up.name.as_str(), up.ahead, up.behind, up.gone),
+        ("origin/main", 2, 1, false)
+    );
+    assert!(
+        branches
+            .iter()
+            .any(|b| b.name == "origin/main" && b.kind == RefKind::Remote),
+        "remote listed"
+    );
+    assert!(!branches.iter().any(|b| b.name.ends_with("/HEAD")));
+
+    git(
+        clone.path(),
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let repo = Repo::discover(clone.path()).expect("a repo");
+    let up = repo.branches().expect("branches")[0].upstream.clone();
+    assert!(up.is_some_and(|u| u.gone));
+}
+
+#[test]
+fn log_from_walks_only_from_its_tips() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    let root = commit(dir.path());
+    git(dir.path(), &["switch", "-q", "-c", "side"]);
+    fs::write(dir.path().join("a.txt"), "side\n").expect("write");
+    let side = commit(dir.path());
+    git(dir.path(), &["switch", "-q", "-"]);
+    fs::write(dir.path().join("b.txt"), "main\n").expect("write");
+    commit(dir.path());
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    let ids: Vec<String> = (repo.log_from(std::slice::from_ref(&side), 10).expect("log"))
+        .into_iter()
+        .map(|c| c.id[..7].to_owned())
+        .collect();
+    assert_eq!(ids, [side[..7].to_owned(), root[..7].to_owned()]);
+    assert_eq!(
+        repo.log(10).expect("log").len(),
+        3,
+        "log still walks every branch"
+    );
+}
+
+/// A repo on `main` with a merged `done` branch and an unmerged `side` branch.
+fn with_branches() -> (tempfile::TempDir, Repo) {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "1\n").expect("write");
+    commit(dir.path());
+    git(dir.path(), &["branch", "-M", "main"]);
+    git(dir.path(), &["branch", "done"]);
+    git(dir.path(), &["switch", "-q", "-c", "side"]);
+    fs::write(dir.path().join("a.txt"), "side\n").expect("write");
+    commit(dir.path());
+    git(dir.path(), &["switch", "-q", "main"]);
+    git(dir.path(), &["tag", "v0.1"]);
+    let repo = Repo::discover(dir.path()).expect("a repo");
+    (dir, repo)
+}
+
+fn find(repo: &Repo, name: &str) -> zdiff_core::Branch {
+    let branches = repo.branches().expect("branches");
+    branches.into_iter().find(|b| b.name == name).expect(name)
+}
+
+#[test]
+fn checkout_switches_to_a_branch_or_detaches_at_a_tag() {
+    let (_dir, repo) = with_branches();
+    repo.checkout(&find(&repo, "side")).expect("switches");
+    assert_eq!(repo.head_name(), "side");
+    repo.checkout(&find(&repo, "v0.1")).expect("detaches");
+    assert_eq!(
+        repo.branches().expect("branches")[0].name,
+        zdiff_core::DETACHED
+    );
+}
+
+#[test]
+fn checkout_of_a_remote_branch_makes_a_tracking_one() {
+    let (origin, _) = with_branches();
+    let clone = tempfile::tempdir().expect("temp dir");
+    let from = origin.path().to_str().expect("utf-8 path");
+    git(clone.path(), &["clone", "-q", from, "."]);
+    let repo = Repo::discover(clone.path()).expect("a repo");
+    repo.checkout(&find(&repo, "origin/side")).expect("tracks");
+    assert_eq!(repo.head_name(), "side");
+    let side = find(&repo, "side");
+    assert_eq!(
+        side.upstream.map(|u| u.name),
+        Some("origin/side".to_owned())
+    );
+}
+
+#[test]
+fn a_new_branch_starts_at_its_commit_and_is_checked_out() {
+    let (_dir, repo) = with_branches();
+    let side = find(&repo, "side");
+    repo.create_branch("try-it", &side.tip).expect("creates");
+    assert_eq!(repo.head_name(), "try-it");
+    assert_eq!(find(&repo, "try-it").tip, side.tip);
+    let refused = repo.create_branch("-x", &side.tip);
+    assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+}
+
+#[test]
+fn deleting_asks_before_dropping_unmerged_work() {
+    let (_dir, repo) = with_branches();
+    assert!(
+        repo.delete_branch("done", false).expect("deletes"),
+        "merged"
+    );
+    assert!(
+        !repo.delete_branch("side", false).expect("runs"),
+        "kept: unmerged"
+    );
+    let names: Vec<_> = repo
+        .branches()
+        .expect("branches")
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.contains(&"side".to_owned()) && !names.contains(&"done".to_owned()));
+    assert!(repo.delete_branch("side", true).expect("forced"));
+    assert!(
+        repo.branches()
+            .expect("branches")
+            .iter()
+            .all(|b| b.name != "side")
+    );
 }
