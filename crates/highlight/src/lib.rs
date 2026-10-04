@@ -135,6 +135,7 @@ mod tests {
             ("a.toml", "key = \"v\""),
             ("a.yaml", "key: 1"),
             ("a.py", "def f(): return 1"),
+            ("a.rb", "def f = :x # c"),
             ("a.go", "package main\nfunc f() int { return 1 }"),
             ("a.sh", "echo \"hi\" # c"),
             ("a.svg", "<svg width=\"4\"><rect/></svg>"),
@@ -211,6 +212,22 @@ mod tests {
         );
         assert_eq!(role("a.go", go, "len"), Some(Class::Constant));
         assert_eq!(role("a.go", go, "x)"), None);
+    }
+
+    #[test]
+    fn ruby_follows_github_roles() {
+        let rb =
+            "class Zdiff < Formula\n  depends_on \"rust\" => :build # c\n  def install; end\nend";
+        assert_eq!(role("a.rb", rb, "class"), Some(Class::Keyword));
+        assert_eq!(role("a.rb", rb, "Zdiff"), Some(Class::Entity));
+        assert_eq!(role("a.rb", rb, "\"rust\""), Some(Class::String));
+        assert_eq!(
+            role("a.rb", rb, ":build"),
+            Some(Class::Constant),
+            "override"
+        );
+        assert_eq!(role("a.rb", rb, "install"), Some(Class::Entity));
+        assert_eq!(role("a.rb", rb, "# c"), Some(Class::Comment));
     }
 
     #[test]

@@ -1,0 +1,99 @@
+name: Release
+
+# Releases when the version in Cargo.toml has no tag yet: builds the binaries,
+# publishes them as a GitHub release, and points Formula/zdiff.rb at them.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency: release
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      new: ${{ steps.version.outputs.new }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: check
+    if: needs.check.outputs.new == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [check, test]
+    if: needs.check.outputs.new == 'true'
+    strategy:
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      # rustup reads rust-toolchain.toml, so this installs the pinned toolchain.
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --profile dist --locked -p zdiff --target ${{ matrix.target }}
+      - run: tar -czf zdiff-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/dist zdiff
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zdiff-${{ matrix.target }}
+          path: zdiff-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "v$VERSION" dist/*.tar.gz --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+      - name: Update the formula
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re
+          formula = pathlib.Path("Formula/zdiff.rb")
+          text = formula.read_text()
+          text = re.sub(r'version "[^"]*"', f'version "{os.environ["VERSION"]}"', text, count=1)
+          for archive in pathlib.Path("dist").glob("*.tar.gz"):
+              sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+              pattern = rf'({re.escape(archive.name)}"\n\s*sha256 ")[0-9a-f]*'
+              text, found = re.subn(pattern, rf"\g<1>{sha}", text)
+              assert found == 1, f"{archive.name} isn't in the formula"
+          formula.write_text(text)
+          PY
+      # Pushes made with the workflow token don't start another run.
+      - name: Commit the formula
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: zdiff $VERSION in the brew formula"
+          git pull --rebase origin main
+          git push origin HEAD:main

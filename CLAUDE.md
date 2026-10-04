@@ -21,6 +21,7 @@ cargo test -p zdiff-core <name>     # single test (substring match) in core
 cargo clippy --workspace --all-targets
 cargo fmt --all
 cargo build --profile profiling     # release optimizations + debug symbols, for profilers
+cargo build --profile dist          # fat LTO, what the release workflow ships (slow)
 ```
 
 `default-members = ["crates/tui"]`, so a bare `cargo test` / `cargo build` only covers the tui crate — pass `--workspace` or `-p zdiff-core` for core.

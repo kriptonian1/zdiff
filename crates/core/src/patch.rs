@@ -621,7 +621,7 @@ mod tests {
     use super::*;
     use crate::rows::Row;
 
-    const SAMPLE: &[u8] = include_bytes!("../../../example/sample.patch");
+    const SAMPLE: &[u8] = include_bytes!("../testdata/sample.patch");
 
     fn parse(text: &str) -> Result<Patch, Error> {
         Patch::parse(text.as_bytes().to_vec())

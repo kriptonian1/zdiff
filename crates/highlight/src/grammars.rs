@@ -139,6 +139,15 @@ pub const GRAMMARS: &[Grammar] = &[
         overrides: &[],
         first_wins: false,
     },
+    #[cfg(feature = "ruby")]
+    Grammar {
+        extensions: &["rb", "rake", "gemspec"],
+        language: tree_sitter_ruby::LANGUAGE,
+        queries: &[tree_sitter_ruby::HIGHLIGHTS_QUERY],
+        // GitHub colors symbols such as `:build` as constants.
+        overrides: &[("string.special.symbol", C::Constant)],
+        first_wins: false,
+    },
     #[cfg(feature = "go")]
     Grammar {
         extensions: &["go"],

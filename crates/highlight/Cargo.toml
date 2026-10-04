@@ -19,9 +19,10 @@ tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-yaml = { version = "0.7", optional = true }
 tree-sitter-xml = { version = "0.7", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
 
 [features]
-default = ["rust", "typescript", "javascript", "json", "toml", "python", "go", "bash", "yaml", "xml"]
+default = ["rust", "typescript", "javascript", "json", "toml", "python", "go", "bash", "yaml", "xml", "ruby"]
 rust = ["dep:tree-sitter-rust"]
 typescript = ["dep:tree-sitter-typescript", "javascript"]
 javascript = ["dep:tree-sitter-javascript"]
@@ -32,6 +33,7 @@ go = ["dep:tree-sitter-go"]
 bash = ["dep:tree-sitter-bash"]
 yaml = ["dep:tree-sitter-yaml"]
 xml = ["dep:tree-sitter-xml"]
+ruby = ["dep:tree-sitter-ruby"]
 
 [lints]
 workspace = true

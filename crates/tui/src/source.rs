@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn the_sample_patch_shows_real_line_numbers_and_gaps() {
-        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/sample.patch");
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/testdata/sample.patch");
         let source = Source::patch(&sample, Only::default()).expect("the sample parses");
         let entries = source.entries();
         let config = (entries.iter().position(|e| e.path.ends_with("config.rs")))
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn focus_keeps_patch_files_and_their_indices() {
-        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../example/sample.patch");
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/testdata/sample.patch");
         let only = Only::new(vec!["src/config.rs".into()]).expect("valid");
         let source = Source::patch(&sample, only).expect("the sample parses");
         let entries = source.entries();
