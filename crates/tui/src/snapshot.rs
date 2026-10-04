@@ -137,6 +137,7 @@ impl Snapshot {
             .map(|(index, (change, &(added, removed)))| FileEntry {
                 path: change.path.clone(),
                 status: change.status(),
+                from: change.from.clone(),
                 added,
                 removed,
                 change: index,

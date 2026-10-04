@@ -90,14 +90,14 @@ impl Repo {
     /// Returns [`Error::Refused`] if that stash is gone, and [`Error::Command`] if git can't
     /// run or fails for another reason, such as local changes in the way.
     pub fn stash(&self, op: StashOp, id: &str) -> Result<Vec<PathBuf>, Error> {
-        let name = self.stash_ref(id)?;
-        let cmd = match op {
-            StashOp::Apply => "stash apply",
-            StashOp::Pop => "stash pop",
-            StashOp::Drop => "stash drop",
-        };
-        let output = self.git(cmd, &["stash", op.as_str(), &name])?;
-        self.finish(cmd, &output, op != StashOp::Drop)
+        if op == StashOp::Drop {
+            return self.stash_drop(id).map(|()| Vec::new());
+        }
+        self.stash_ref(id)?;
+        // Applying by commit id can't hit another stash if the list moved meanwhile.
+        let output = self.git("stash apply", &["stash", "apply", id])?;
+        let conflicts = self.finish("stash apply", &output, true)?;
+        self.drop_if_clean(op == StashOp::Pop, id, conflicts)
     }
 
     /// Stashes the changes as `push` says; `false` when there was nothing to stash.
@@ -133,9 +133,31 @@ impl Repo {
     /// gone, and [`Error::Command`] if git refuses, such as for a name already taken.
     pub fn stash_branch(&self, id: &str, name: &str) -> Result<Vec<PathBuf>, Error> {
         let name = check_name(name)?;
-        let stash = self.stash_ref(id)?;
-        let output = self.git("stash branch", &["stash", "branch", name, &stash])?;
-        self.finish("stash branch", &output, true)
+        self.stash_ref(id)?;
+        let output = self.git("stash branch", &["stash", "branch", name, id])?;
+        let conflicts = self.finish("stash branch", &output, true)?;
+        // Given a commit id, git keeps the stash; drop it as `stash branch` does.
+        self.drop_if_clean(true, id, conflicts)
+    }
+
+    /// Drops the stash `id` after a clean apply when `drop`, as a pop does; a conflicted one
+    /// stays for another try.
+    fn drop_if_clean(
+        &self,
+        drop: bool,
+        id: &str,
+        conflicts: Vec<PathBuf>,
+    ) -> Result<Vec<PathBuf>, Error> {
+        if drop && conflicts.is_empty() {
+            self.stash_drop(id)?;
+        }
+        Ok(conflicts)
+    }
+
+    fn stash_drop(&self, id: &str) -> Result<(), Error> {
+        let name = self.stash_ref(id)?;
+        let output = self.git("stash drop", &["stash", "drop", &name])?;
+        self.finish("stash drop", &output, false).map(drop)
     }
 
     /// What a stash holds: its base against it, plus the untracked files it saved, which git
@@ -162,8 +184,7 @@ impl Repo {
 
     /// `stash@{n}` for the stash `id` where it is in the list now.
     fn stash_ref(&self, id: &str) -> Result<String, Error> {
-        // ponytail: another git can change the list between this lookup and the command; the
-        // gap is milliseconds.
+        // git drops only by `stash@{n}`, never by id; another git can still move it meanwhile.
         let n = (self.stashes()?.iter())
             .position(|s| s.id == id)
             .ok_or(Error::Refused("that stash is gone; reopen the list"))?;

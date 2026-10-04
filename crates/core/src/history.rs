@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use gix::ObjectId;
 use gix::bstr::ByteSlice;
-use gix::revision::walk::Sorting;
-use gix::traverse::commit::simple::CommitTimeOrder;
+use gix::traverse::commit::Simple;
+use gix::traverse::commit::simple::{CommitTimeOrder, Sorting};
 
 use crate::Error;
 use crate::repo::{Repo, Spec};
@@ -55,6 +55,45 @@ impl Commit {
     }
 }
 
+/// A history walk that hands out commits a page at a time, going on from where it stopped.
+pub struct Log {
+    walk: Simple<gix::OdbHandle, fn(&gix::oid) -> bool>,
+    refs: Names,
+    head: Option<ObjectId>,
+}
+
+impl std::fmt::Debug for Log {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Log").finish_non_exhaustive()
+    }
+}
+
+impl Log {
+    /// The next `n` commits of `repo`, the repository the walk started in, newest first;
+    /// fewer once the history runs out.
+    ///
+    /// # Errors
+    /// Returns [`Error::Git`] if a commit can't be read.
+    pub fn next(&mut self, repo: &Repo, n: usize) -> Result<Vec<Commit>, Error> {
+        let mut commits = Vec::with_capacity(n.min(1024));
+        for info in self.walk.by_ref().take(n) {
+            let info = info.map_err(|e| Error::Git(e.into()))?;
+            let (message, author) = describe(&repo.inner.find_commit(info.id)?);
+            commits.push(Commit {
+                id: info.id.to_string(),
+                summary: message.lines().next().unwrap_or_default().to_owned(),
+                message,
+                author,
+                time: info.commit_time.unwrap_or_default(),
+                parents: info.parent_ids.iter().map(ToString::to_string).collect(),
+                refs: self.refs.get(&info.id).cloned().unwrap_or_default().into(),
+                head: Some(info.id) == self.head,
+            });
+        }
+        Ok(commits)
+    }
+}
+
 impl Repo {
     /// The commit HEAD points to, as full hex; `None` before the first commit.
     #[must_use]
@@ -67,14 +106,7 @@ impl Repo {
     /// # Errors
     /// Returns [`Error::Git`] if a reference or commit can't be read.
     pub fn log(&self, limit: usize) -> Result<Vec<Commit>, Error> {
-        let Ok(head) = self.inner.head_id().map(gix::Id::detach) else {
-            // Unborn HEAD: nothing committed yet.
-            return Ok(Vec::new());
-        };
-        let (_, branches) = self.ref_names()?;
-        let mut tips = vec![head];
-        tips.extend(branches.into_iter().filter(|id| *id != head));
-        self.walk(tips, limit)
+        self.history()?.next(self, limit)
     }
 
     /// Up to `limit` commits reachable from `tips` (revisions such as ids or `HEAD`), newest
@@ -83,36 +115,46 @@ impl Repo {
     /// # Errors
     /// Returns [`Error::Git`] if a tip doesn't resolve or a commit can't be read.
     pub fn log_from(&self, tips: &[String], limit: usize) -> Result<Vec<Commit>, Error> {
+        self.history_from(tips)?.next(self, limit)
+    }
+
+    /// The walk [`Repo::log`] takes, to page through with [`Log::next`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Git`] if a reference can't be read.
+    pub fn history(&self) -> Result<Log, Error> {
+        let Ok(head) = self.inner.head_id().map(gix::Id::detach) else {
+            // Unborn HEAD: nothing committed yet.
+            return self.walk(Vec::new());
+        };
+        let (_, branches) = self.ref_names()?;
+        let mut tips = vec![head];
+        tips.extend(branches.into_iter().filter(|id| *id != head));
+        self.walk(tips)
+    }
+
+    /// The walk [`Repo::log_from`] takes, to page through with [`Log::next`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Git`] if a tip doesn't resolve or a reference can't be read.
+    pub fn history_from(&self, tips: &[String]) -> Result<Log, Error> {
         let tips = (tips.iter())
             .map(|tip| Ok(self.inner.rev_parse_single(tip.as_str())?.detach()))
             .collect::<Result<Vec<_>, Error>>()?;
-        self.walk(tips, limit)
+        self.walk(tips)
     }
 
-    fn walk(&self, tips: Vec<ObjectId>, limit: usize) -> Result<Vec<Commit>, Error> {
-        let head = self.inner.head_id().ok().map(gix::Id::detach);
+    fn walk(&self, tips: Vec<ObjectId>) -> Result<Log, Error> {
         let (refs, _) = self.ref_names()?;
-        // ponytail: each page walks again from the tips, O(total) per page; keep the walk
-        // between pages if 50k-commit repos feel slow.
-        let walk = (self.inner.rev_walk(tips))
+        let walk = Simple::new(tips, self.inner.objects.clone())
             .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
-            .all()?;
-        let mut commits = Vec::with_capacity(limit.min(1024));
-        for info in walk.take(limit) {
-            let info = info?;
-            let (message, author) = describe(&info.object()?);
-            commits.push(Commit {
-                id: info.id.to_string(),
-                summary: message.lines().next().unwrap_or_default().to_owned(),
-                message,
-                author,
-                time: info.commit_time.unwrap_or_default(),
-                parents: info.parent_ids.iter().map(ToString::to_string).collect(),
-                refs: refs.get(&info.id).cloned().unwrap_or_default().into(),
-                head: Some(info.id) == head,
-            });
-        }
-        Ok(commits)
+            .map_err(|e| Error::Git(e.into()))?
+            .commit_graph(self.inner.commit_graph_if_enabled().ok().flatten());
+        Ok(Log {
+            walk,
+            refs,
+            head: self.inner.head_id().ok().map(gix::Id::detach),
+        })
     }
 
     /// The two sides that show `commit`: its first parent against it, or the empty tree for a

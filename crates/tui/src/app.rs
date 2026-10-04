@@ -181,6 +181,8 @@ fn build_rows(file: &FileDiff, shape: Shape) -> Vec<Row> {
 pub struct FileEntry {
     pub path: PathBuf,
     pub status: Status,
+    /// Where a renamed file was before.
+    pub from: Option<PathBuf>,
     pub added: u32,
     pub removed: u32,
     /// Index of this file's `Change` in the list the app was started with.
@@ -569,11 +571,13 @@ impl App {
     pub fn pending(&self) -> Apply {
         let mut work = Apply::default();
         for (_, file) in self.tree.files() {
-            match self.marks.get(&file.path) {
-                Some(true) => work.stage.push(file.path.clone()),
-                Some(false) => work.unstage.push(file.path.clone()),
-                None => {}
-            }
+            // A rename stages or unstages both of its paths.
+            let list = match self.marks.get(&file.path) {
+                Some(true) => &mut work.stage,
+                Some(false) => &mut work.unstage,
+                None => continue,
+            };
+            list.extend(file.from.iter().chain([&file.path]).cloned());
         }
         work
     }
@@ -2938,6 +2942,7 @@ mod tests {
         FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,

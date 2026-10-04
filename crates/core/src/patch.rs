@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::Error;
 use crate::diff::{FileDiff, Hunk};
@@ -59,6 +59,12 @@ impl Default for PatchFile {
 }
 
 impl PatchFile {
+    /// Where a renamed file was before.
+    #[must_use]
+    pub fn from(&self) -> Option<&Path> {
+        (self.status == Status::Renamed).then_some(self.old_path.as_path())
+    }
+
     /// Lines added and removed, as `(added, removed)`.
     #[must_use]
     pub fn stats(&self) -> (u32, u32) {
@@ -123,7 +129,7 @@ impl Patch {
         }
         let (mut old, mut new) = (Side::default(), Side::default());
         let (mut hunks, mut known) = (Vec::new(), Vec::new());
-        // ponytail: each placeholder line costs 4 bytes of line index; phase 2 loads real files.
+        // Placeholder lines cost 4 bytes of line index each; `full_diff` loads the real files.
         for hunk in &file.hunks {
             old.pad_to(first_line(hunk.old));
             new.pad_to(first_line(hunk.new));
@@ -194,10 +200,9 @@ impl Patch {
         }
     }
 
-    /// `old` with `file`'s hunks applied at their exact line numbers; `None` when a context
-    /// or removed line doesn't match, so a patch for other content never shows wrong text.
-    // ponytail: exact positions only; search nearby lines like `git apply` if drifted bases
-    // turn up.
+    /// `old` with `file`'s hunks applied, each where its context and removed lines match
+    /// nearest its line number, like `git apply`; `None` when one matches nowhere, so a patch
+    /// for other content never shows wrong text.
     fn apply(&self, old: &[u8], file: &PatchFile) -> Option<Vec<u8>> {
         let mut lines: Vec<&[u8]> = old.split(|&b| b == b'\n').collect();
         let old_eol = old.is_empty() || old.ends_with(b"\n");
@@ -206,15 +211,26 @@ impl Patch {
         }
         let mut out = Vec::with_capacity(old.len() + 64);
         let mut at = 0;
+        // How far the base has drifted from the patch's line numbers so far.
+        let mut drift = 0;
         let push = |out: &mut Vec<u8>, line: &[u8]| {
             out.extend_from_slice(line);
             out.push(b'\n');
         };
         for hunk in &file.hunks {
-            let start = first_line(hunk.old) as usize;
-            if start < at || start > lines.len() {
-                return None;
-            }
+            let numbered = first_line(hunk.old) as usize;
+            let fits = |p: usize| {
+                let old_lines = (hunk.lines.iter()).filter(|(marker, _)| *marker != b'+');
+                old_lines
+                    .enumerate()
+                    .all(|(i, (_, range))| lines.get(p + i) == Some(&&self.bytes[range.clone()]))
+            };
+            let start = nearest(
+                numbered.saturating_add_signed(drift),
+                at..=lines.len(),
+                fits,
+            )?;
+            drift = start.cast_signed() - numbered.cast_signed();
             lines[at..start]
                 .iter()
                 .for_each(|line| push(&mut out, line));
@@ -222,9 +238,6 @@ impl Patch {
             for (marker, range) in &hunk.lines {
                 let line = &self.bytes[range.clone()];
                 if *marker != b'+' {
-                    if lines.get(at) != Some(&line) {
-                        return None;
-                    }
                     at += 1;
                 }
                 if *marker != b'-' {
@@ -241,6 +254,20 @@ impl Patch {
         }
         Some(out)
     }
+}
+
+/// The position in `range` closest to `from` where `fits`, trying later lines first on a tie.
+fn nearest(
+    from: usize,
+    range: std::ops::RangeInclusive<usize>,
+    fits: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let from = from.clamp(*range.start(), *range.end());
+    let reach = (from - range.start()).max(range.end() - from);
+    (0..=reach)
+        .flat_map(|k| [from.checked_add(k), from.checked_sub(k).filter(|_| k > 0)])
+        .flatten()
+        .find(|&p| range.contains(&p) && fits(p))
 }
 
 /// One side of a partial diff while it's built.
@@ -359,8 +386,10 @@ impl Parser<'_> {
             file.status = Status::Deleted;
         } else if let Some(path) = line.strip_prefix(b"rename to ") {
             file.path = path_of(path, "");
+            file.status = Status::Renamed;
         } else if let Some(path) = line.strip_prefix(b"rename from ") {
             file.old_path = path_of(path, "");
+            file.status = Status::Renamed;
         } else if let Some(ids) = line.strip_prefix(b"index ") {
             file.blobs = blob_ids(ids);
         } else if let Some(path) = line.strip_prefix(b"--- ") {
@@ -610,7 +639,7 @@ mod tests {
                 ("VERSION".into(), Status::Modified),
                 ("assets/logo.png".into(), Status::Modified),
                 ("docs/café.txt".into(), Status::Modified),
-                ("docs/guide.md".into(), Status::Modified),
+                ("docs/guide.md".into(), Status::Renamed),
                 ("src/config.rs".into(), Status::Modified),
                 ("src/greet.rs".into(), Status::Modified),
                 ("src/legacy.rs".into(), Status::Deleted),
@@ -764,6 +793,17 @@ mod tests {
             "a context line differs"
         );
         assert_eq!(applied(edit, "a\n"), None, "the file is too short");
+        assert_eq!(
+            applied(edit, "x\ny\nz\na\nb\nc\nd\n").as_deref(),
+            Some("x\ny\nz\na\nb\nC\nD\nd\n"),
+            "found 3 lines further down"
+        );
+        let two = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+A\n@@ -3 +3 @@\n-c\n+C\n";
+        assert_eq!(
+            applied(two, "new\na\nb\nc\n").as_deref(),
+            Some("new\nA\nb\nC\n"),
+            "the second hunk starts from the first one's drift"
+        );
 
         let insert = "--- a/x\n+++ b/x\n@@ -1,0 +2,1 @@\n+new\n";
         assert_eq!(applied(insert, "a\nb\n").as_deref(), Some("a\nnew\nb\n"));

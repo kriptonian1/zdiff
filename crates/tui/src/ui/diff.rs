@@ -624,6 +624,7 @@ mod tests {
         let entry = |path: &str| FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -689,6 +690,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "logo.png".into(),
             status: Status::Modified,
+            from: None,
             added: 0,
             removed: 0,
             change: 0,
@@ -733,6 +735,7 @@ mod tests {
         let entry = |path: &str, added| FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added,
             removed: 0,
             change: 0,
@@ -779,6 +782,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 2,
             removed: 1,
             change: 0,
@@ -815,6 +819,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -853,6 +858,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -922,6 +928,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -946,6 +953,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "new.rs".into(),
             status: Status::Untracked,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,
@@ -961,6 +969,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -981,6 +990,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 pub use branches::{Branch, COUNT_LIMIT, DETACHED, RefKind, Upstream};
 pub use diff::{FileDiff, Hunk, Text};
 pub use graph::{Cell, GraphRow, layout};
-pub use history::Commit;
+pub use history::{Commit, Log};
 pub use patch::{Patch, PatchFile};
 pub use repo::{Change, Repo, Spec, Staged, Status};
 pub use rows::{Kind, Row, Side, expand, locate, reveal, unified};

@@ -221,7 +221,7 @@ impl Colors {
     pub fn status(&self, status: Status) -> Color {
         match status {
             Status::Added | Status::Untracked => self.green,
-            Status::Modified => self.yellow,
+            Status::Modified | Status::Renamed => self.yellow,
             Status::Deleted => self.red,
         }
     }

@@ -56,6 +56,8 @@ impl FileDiff {
         let mut rows = Vec::with_capacity(capacity as usize);
         // First line on each side not yet covered by a row.
         let (mut old, mut new) = (0, 0);
+        // Blocks only move down, so each scans for a heading only past the previous one.
+        let (mut scanned, mut heading) = (0, None);
         for block in self
             .hunks
             .chunk_by(|a, b| b.old.start - a.old.end <= around)
@@ -67,10 +69,12 @@ impl FileDiff {
             let (end_old, end_new) = (last.old.end + trail, last.new.end + trail);
 
             push_fold(&mut rows, old, new, start_old - old);
+            heading = self.heading(scanned..start_old).or(heading);
+            scanned = start_old;
             rows.push(Row::Header {
                 old: start_old..end_old,
                 new: start_new..end_new,
-                heading: self.heading(start_old),
+                heading,
             });
             let (mut o, mut n) = (start_old, start_new);
             for hunk in block {
@@ -121,10 +125,9 @@ impl FileDiff {
         rows
     }
 
-    /// Nearest line before `before` starting with a letter, `_`, or `$` (git's default).
-    // ponytail: scans back to line 0 per block; cache per block if headers get slow.
-    fn heading(&self, before: u32) -> Option<u32> {
-        (0..before).rev().find(|&i| {
+    /// Last line in `lines` starting with a letter, `_`, or `$` (git's default).
+    fn heading(&self, lines: std::ops::Range<u32>) -> Option<u32> {
+        lines.rev().find(|&i| {
             self.old
                 .line(i)
                 .first()
@@ -345,6 +348,25 @@ mod tests {
             _ => None,
         });
         assert_eq!(heading, Some(3));
+    }
+
+    #[test]
+    fn later_blocks_keep_the_last_heading_above_them() {
+        let body = (1..=20).fold(String::new(), |mut out, n| {
+            writeln!(out, "    {n}").expect("writing to a String cannot fail");
+            out
+        });
+        let old = format!("use x;\n\nfn a() {{\n{body}}}\n");
+        let new = (old.replacen("    1\n", "    one\n", 1))
+            .replace("    10\n", "    ten\n")
+            .replace("    19\n", "    nineteen\n");
+        let headings: Vec<_> = (diff(&old, &new).rows(1).into_iter())
+            .filter_map(|r| match r {
+                Row::Header { heading, .. } => Some(heading),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headings, [Some(0), Some(2), Some(2)]);
     }
 
     #[test]

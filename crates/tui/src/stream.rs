@@ -329,6 +329,7 @@ mod tests {
             .map(|(change, &(path, added, removed))| FileEntry {
                 path: path.into(),
                 status: Status::Modified,
+                from: None,
                 added,
                 removed,
                 change,

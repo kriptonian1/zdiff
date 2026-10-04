@@ -659,6 +659,7 @@ mod tests {
         let file = |path: &str, added| crate::app::FileEntry {
             path: path.into(),
             status: zdiff_core::Status::Modified,
+            from: None,
             added,
             removed: 1,
             change: 0,

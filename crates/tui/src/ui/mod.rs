@@ -241,6 +241,7 @@ mod tests {
         let entry = FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 2,
             removed: 1,
             change: 0,
@@ -295,6 +296,7 @@ mod tests {
         let entry = |path: &str, added, removed| FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added,
             removed,
             change: 0,

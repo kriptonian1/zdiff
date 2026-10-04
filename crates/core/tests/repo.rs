@@ -146,6 +146,55 @@ fn staged_then_reverted_is_not_a_staged_change() {
 }
 
 #[test]
+fn a_worktree_edited_back_to_head_is_no_change() {
+    let dir = init();
+    fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+    commit(dir.path());
+    fs::write(dir.path().join("f.txt"), "b\n").unwrap();
+    git(dir.path(), &["add", "f.txt"]);
+    fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+    let repo = Repo::discover(dir.path()).unwrap();
+    assert!(list(&repo, &Spec::default()).is_empty(), "HEAD → worktree");
+    assert_eq!(
+        list(&repo, &Spec::Unstaged),
+        [("f.txt".into(), Status::Modified)]
+    );
+}
+
+#[test]
+fn renames_show_once_with_where_they_came_from() {
+    let dir = init();
+    let body = "one\ntwo\nthree\nfour\nfive\n";
+    fs::write(dir.path().join("old.txt"), body).unwrap();
+    let c1 = commit(dir.path());
+    git(dir.path(), &["mv", "old.txt", "new.txt"]);
+    let repo = Repo::discover(dir.path()).unwrap();
+    for spec in [Spec::default(), Spec::Staged("HEAD".into())] {
+        let changes = repo.changes(&spec).unwrap();
+        assert_eq!(summary(&changes), [("new.txt".into(), Status::Renamed)]);
+        assert_eq!(changes[0].from.as_deref(), Some(Path::new("old.txt")));
+        assert_eq!(
+            changes[0].staged(),
+            if spec == Spec::default() {
+                Staged::Fully
+            } else {
+                Staged::No
+            }
+        );
+        assert!(
+            repo.diff(&changes[0]).unwrap().hunks.is_empty(),
+            "same content"
+        );
+    }
+
+    fs::write(dir.path().join("new.txt"), format!("{body}six\n")).unwrap();
+    let c2 = commit(dir.path());
+    let changes = repo.changes(&Spec::Revs(c1, c2)).unwrap();
+    assert_eq!(summary(&changes), [("new.txt".into(), Status::Renamed)]);
+    assert_eq!(repo.diff(&changes[0]).unwrap().stats(), (1, 0));
+}
+
+#[test]
 fn between_two_revisions() {
     let dir = init();
     fs::create_dir(dir.path().join("src")).unwrap();
@@ -351,6 +400,32 @@ fn apply_unstages_back_to_head() {
     repo.apply(&[], &paths(&["gone", "mod", "new"])).unwrap();
     assert_eq!(git(dir.path(), &["diff", "--cached", "--name-only"]), "");
     assert_eq!(status(dir.path()), " D gone\n M mod\n?? new");
+}
+
+#[test]
+fn apply_keeps_the_tree_cache_valid_for_git() {
+    let dir = init();
+    fs::create_dir_all(dir.path().join("src/deep")).unwrap();
+    fs::write(dir.path().join("src/deep/a"), "1\n").unwrap();
+    fs::write(dir.path().join("src/b"), "1\n").unwrap();
+    fs::write(dir.path().join("top"), "1\n").unwrap();
+    commit(dir.path());
+    // A fresh write-tree fills every cached tree.
+    git(dir.path(), &["write-tree"]);
+    fs::write(dir.path().join("src/deep/a"), "2\n").unwrap();
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    repo.apply(&paths(&["src/deep/a"]), &[]).unwrap();
+    let tree = git(dir.path(), &["write-tree"]);
+    assert_eq!(
+        git(dir.path(), &["rev-parse", &format!("{tree}:src/deep/a")]),
+        git(dir.path(), &["rev-parse", ":src/deep/a"]),
+        "git rebuilt the stale trees from the index"
+    );
+    assert_eq!(
+        git(dir.path(), &["rev-parse", &format!("{tree}:src/b")]),
+        git(dir.path(), &["rev-parse", "HEAD:src/b"])
+    );
 }
 
 #[test]
@@ -604,6 +679,22 @@ fn log_walks_other_branches_too() {
         log.iter().any(|c| c.id == side && *c.refs == ["side"]),
         "{log:#?}"
     );
+}
+
+#[test]
+fn a_history_pages_on_from_where_it_stopped() {
+    let dir = init();
+    for n in 0..5 {
+        fs::write(dir.path().join("a.txt"), format!("{n}\n")).unwrap();
+        commit_at(dir.path(), &format!("c{n}"), n);
+    }
+    let repo = Repo::discover(dir.path()).unwrap();
+    let mut history = repo.history().unwrap();
+    let mut paged = history.next(&repo, 2).unwrap();
+    paged.extend(history.next(&repo, 2).unwrap());
+    paged.extend(history.next(&repo, 2).unwrap());
+    assert_eq!(paged, repo.log(10).unwrap());
+    assert!(history.next(&repo, 2).unwrap().is_empty());
 }
 
 #[test]
@@ -1006,6 +1097,21 @@ fn a_new_branch_starts_at_its_commit_and_is_checked_out() {
     assert_eq!(find(&repo, "try-it").tip, side.tip);
     let refused = repo.create_branch("-x", &side.tip);
     assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+}
+
+#[test]
+fn a_branch_merged_into_its_upstream_deletes_without_asking() {
+    let (origin, _) = with_branches();
+    let clone = tempfile::tempdir().expect("temp dir");
+    let from = origin.path().to_str().expect("utf-8 path");
+    git(clone.path(), &["clone", "-q", from, "."]);
+    git(clone.path(), &["switch", "-q", "--track", "origin/side"]);
+    git(clone.path(), &["switch", "-q", "main"]);
+    let repo = Repo::discover(clone.path()).expect("a repo");
+    assert!(
+        repo.delete_branch("side", false).expect("deletes"),
+        "merged into origin/side, though not into HEAD"
+    );
 }
 
 #[test]

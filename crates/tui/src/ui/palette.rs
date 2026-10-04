@@ -438,6 +438,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,
@@ -480,6 +481,7 @@ mod tests {
         let files = paths.iter().map(|&path| FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added: 3,
             removed: 1,
             change: 0,
@@ -535,6 +537,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "src/a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,

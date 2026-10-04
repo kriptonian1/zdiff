@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gix::bstr::BStr;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
@@ -31,21 +31,7 @@ impl Repo {
                 }
                 Err(source) => return Err(Error::Read { path: full, source }),
             };
-            let read_err = |source| Error::Read {
-                path: full.clone(),
-                source,
-            };
-            let bytes = if meta.is_symlink() {
-                read_worktree(&full).map_err(read_err)?
-            } else {
-                let file = fs::File::open(&full).map_err(read_err)?;
-                let mut bytes = Vec::new();
-                pipeline
-                    .convert_to_git(file, path, &index)?
-                    .read_to_end(&mut bytes)
-                    .map_err(read_err)?;
-                bytes
-            };
+            let bytes = self.to_git(&mut pipeline, &index, path)?;
             let id = self.inner.write_blob(bytes)?.detach();
             let mode = if meta.is_symlink() {
                 Mode::SYMLINK
@@ -69,9 +55,12 @@ impl Repo {
                 None => remove(&mut index, &key),
             }
         }
-        // ponytail: dropping the tree cache makes git's next commit rebuild every tree;
-        // keep it updated instead once gix issue #2421 lands.
-        index.remove_tree();
+        // gix can't update the tree cache yet (gix issue #2421); git rebuilds only stale trees.
+        if let Some(tree) = index.tree_mut() {
+            for path in stage.iter().chain(unstage) {
+                invalidate(tree, gix::path::into_bstr(path.as_path()).as_ref());
+            }
+        }
         (index.write(gix::index::write::Options::default())).map_err(|e| Error::Git(e.into()))?;
         Ok(())
     }
@@ -95,8 +84,7 @@ impl Repo {
         }
         let index = self.index()?;
         let head = self.tree("HEAD")?;
-        // ponytail: rebuilds the tree from every index entry, O(files); edit HEAD's tree with
-        // only the staged changes once repos pass ~100k files.
+        // O(files) upserts in memory; `editor.write` stores only the trees that changed.
         let mut editor = self.inner.empty_tree().edit()?;
         for entry in index.entries() {
             if entry.stage() != Stage::Unconflicted {
@@ -122,6 +110,30 @@ impl Repo {
 
     /// The index fresh from disk, so a write never undoes another git's changes; empty in a
     /// new repository, which has no index file until something is staged.
+    /// The worktree file at `path` as git would store it: through the clean filters, or a
+    /// symlink's target.
+    pub(crate) fn to_git(
+        &self,
+        pipeline: &mut gix::filter::Pipeline<'_>,
+        index: &gix::index::State,
+        path: &Path,
+    ) -> Result<Vec<u8>, Error> {
+        let full = self.workdir.join(path);
+        let read_err = |source| Error::Read {
+            path: full.clone(),
+            source,
+        };
+        if fs::symlink_metadata(&full).map_err(read_err)?.is_symlink() {
+            return read_worktree(&full).map_err(read_err);
+        }
+        let file = fs::File::open(&full).map_err(read_err)?;
+        let mut bytes = Vec::new();
+        (pipeline.convert_to_git(file, path, index)?)
+            .read_to_end(&mut bytes)
+            .map_err(read_err)?;
+        Ok(bytes)
+    }
+
     pub(crate) fn index(&self) -> Result<gix::index::File, Error> {
         let path = self.inner.index_path();
         let index = if path.exists() {
@@ -170,4 +182,18 @@ fn clean(message: &str) -> String {
 
 fn remove(index: &mut gix::index::File, path: &BStr) {
     index.remove_entries(|_, entry_path, _| entry_path == path);
+}
+
+/// Marks the cached trees above `path` stale, as git does when it changes the index; a
+/// directory `path` replaced by a file drops its cached tree.
+fn invalidate(tree: &mut gix::index::extension::Tree, path: &[u8]) {
+    tree.num_entries = None;
+    let Some(slash) = path.iter().position(|&b| b == b'/') else {
+        tree.children.retain(|child| child.name.as_slice() != path);
+        return;
+    };
+    let (dir, rest) = (&path[..slash], &path[slash + 1..]);
+    if let Some(child) = (tree.children.iter_mut()).find(|c| c.name.as_slice() == dir) {
+        invalidate(child, rest);
+    }
 }

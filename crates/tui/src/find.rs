@@ -176,6 +176,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 1,
             change: 0,

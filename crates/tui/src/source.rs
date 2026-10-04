@@ -63,6 +63,7 @@ impl Source {
                     FileEntry {
                         path: file.path.clone(),
                         status: file.status,
+                        from: file.from().map(Path::to_path_buf),
                         added,
                         removed,
                         change,

@@ -201,6 +201,9 @@ fn node_row<'a>(
             spans.push(entry.status.as_str().fg(c.status(entry.status)));
             spans.push(" ".into());
             spans.push(Span::raw(name));
+            if let Some(from) = &entry.from {
+                spans.push(format!(" ← {}", from.display()).fg(c.dim));
+            }
             counts(c, entry.added, entry.removed)
         }
     };
@@ -222,6 +225,7 @@ mod tests {
             FileEntry {
                 path: "src/repo.rs".into(),
                 status: Status::Modified,
+                from: None,
                 added: 31,
                 removed: 7,
                 change: 0,
@@ -230,6 +234,7 @@ mod tests {
             FileEntry {
                 path: "src/new.rs".into(),
                 status: Status::Untracked,
+                from: None,
                 added: 2,
                 removed: 0,
                 change: 1,
@@ -275,6 +280,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "a.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,
@@ -306,6 +312,7 @@ mod tests {
         let entry = |path: &str, staged, change| FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change,
@@ -359,6 +366,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "f.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,
@@ -419,6 +427,7 @@ mod tests {
         let mut app = App::new(vec![FileEntry {
             path: "f.rs".into(),
             status: Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,

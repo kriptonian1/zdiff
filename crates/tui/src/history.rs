@@ -790,6 +790,7 @@ mod tests {
         let entry = crate::app::FileEntry {
             path: "a.rs".into(),
             status: zdiff_core::Status::Modified,
+            from: None,
             added: 1,
             removed: 0,
             change: 0,

@@ -147,14 +147,33 @@ impl Repo {
         } else {
             ("branch -d", "-d")
         };
-        let output = self.git(cmd, &["branch", flag, name])?;
-        // ponytail: matches git's English message; ask `merge-base --is-ancestor` instead if a
-        // localized git breaks it.
-        let unmerged = String::from_utf8_lossy(&output.stderr).contains("not fully merged");
-        if !output.status.success() && unmerged {
+        if !force && !self.merged(name)? {
             return Ok(false);
         }
+        let output = self.git(cmd, &["branch", flag, name])?;
         self.finish(cmd, &output, false).map(|_| true)
+    }
+
+    /// Whether the local branch `name` is merged where `git branch -d` looks: into its
+    /// upstream when that's set and exists, else into HEAD. A missing branch counts as merged,
+    /// so git reports it.
+    fn merged(&self, name: &str) -> Result<bool, Error> {
+        let full = format!("refs/heads/{name}");
+        let Some(mut branch) = self.inner.try_find_reference(full.as_str())? else {
+            return Ok(true);
+        };
+        let tip = branch.peel_to_id()?.detach();
+        let mut config = self.inner.clone();
+        config.reload()?;
+        let base = match self.tracking(&config, branch.name()) {
+            Some((_, Some(id))) => id,
+            _ => match self.inner.head_id() {
+                Ok(id) => id.detach(),
+                Err(_) => return Ok(false),
+            },
+        };
+        // No common base means unrelated histories: not merged.
+        Ok(self.inner.merge_base(tip, base).is_ok_and(|b| b == tip))
     }
 
     fn branch(
@@ -186,17 +205,8 @@ impl Repo {
         name: &gix::refs::FullNameRef,
         tip: ObjectId,
     ) -> Option<Upstream> {
-        let tracking = (config.branch_remote_tracking_ref_name(name, Direction::Fetch))?.ok()?;
-        let short = tracking.as_ref().shorten().to_string();
-        let found = self
-            .inner
-            .try_find_reference(tracking.as_ref())
-            .ok()
-            .flatten();
-        let Some(id) = found
-            .and_then(|mut r| r.peel_to_id().ok())
-            .map(gix::Id::detach)
-        else {
+        let (short, found) = self.tracking(config, name)?;
+        let Some(id) = found else {
             return Some(Upstream {
                 name: short,
                 ahead: 0,
@@ -204,8 +214,6 @@ impl Repo {
                 gone: true,
             });
         };
-        // ponytail: two walks per local branch with an upstream; count only the selected
-        // branch if repos with hundreds of branches open slowly.
         let only = |from: ObjectId, hide: ObjectId| {
             (self.inner.rev_walk([from]).with_hidden([hide]).all())
                 .map_or(0, |walk| walk.take(COUNT_LIMIT).count())
@@ -216,5 +224,23 @@ impl Repo {
             behind: only(id, tip),
             gone: false,
         })
+    }
+
+    /// The short name of the upstream `config` sets for the local branch `name`, and its tip;
+    /// `None` when none is configured, and no tip when its ref is gone.
+    fn tracking(
+        &self,
+        config: &gix::Repository,
+        name: &gix::refs::FullNameRef,
+    ) -> Option<(String, Option<ObjectId>)> {
+        let tracking = (config.branch_remote_tracking_ref_name(name, Direction::Fetch))?.ok()?;
+        let tip = (self
+            .inner
+            .try_find_reference(tracking.as_ref())
+            .ok()
+            .flatten())
+        .and_then(|mut r| r.peel_to_id().ok())
+        .map(gix::Id::detach);
+        Some((tracking.as_ref().shorten().to_string(), tip))
     }
 }

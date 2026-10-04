@@ -264,6 +264,7 @@ mod tests {
         FileEntry {
             path: path.into(),
             status: Status::Modified,
+            from: None,
             added: 2,
             removed: 1,
             change: 0,
