@@ -36,6 +36,12 @@ brew tap kriptonian1/zdiff https://github.com/kriptonian1/zdiff
 brew install zdiff
 ```
 
+macOS and most Linux systems ship an unrelated `/usr/bin/zdiff` that compares gzip files. If `zdiff` prints `usage: /usr/bin/zdiff [options] file1 [file2]`, put Homebrew first in your PATH:
+
+```bash
+export PATH="$(brew --prefix)/bin:$PATH"
+```
+
 ### Cargo
 
 ```bash

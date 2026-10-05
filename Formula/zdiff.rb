@@ -31,6 +31,15 @@ class Zdiff < Formula
     bin.install "zdiff"
   end
 
+  def caveats
+    <<~EOS
+      macOS and most Linux systems ship an unrelated /usr/bin/zdiff (from gzip).
+      If `zdiff --version` doesn't print zdiff #{version}, put #{HOMEBREW_PREFIX}/bin
+      before /usr/bin in your PATH:
+        export PATH="#{HOMEBREW_PREFIX}/bin:$PATH"
+    EOS
+  end
+
   test do
     assert_match version.to_s, shell_output("#{bin}/zdiff --version")
     assert_match "not a git worktree", shell_output("#{bin}/zdiff 2>&1", 1)
