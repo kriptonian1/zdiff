@@ -16,6 +16,8 @@ pub enum Source {
         repo: Repo,
         spec: Spec,
         snapshot: Snapshot,
+        /// The startup spec, which history's Back returns to.
+        home: Spec,
         /// Paths shown, from `--focus`; `snapshot` holds only these.
         only: Only,
     },

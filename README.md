@@ -23,6 +23,7 @@ Written in Rust. It reads git in-process with [gitoxide](https://github.com/Gito
 - Check files in the sidebar, stage them, and commit without leaving the viewer.
 - History, branches, and stashes, each in its own popup.
 - Image diffs (PNG, JPEG, GIF, WebP, BMP, ICO, SVG) as pictures, with 2-up, swipe, and onion skin compare.
+- Compares branches: a branch against your working tree, or two branches the way a GitHub PR shows them.
 - Opens a patch file, or a patch on stdin.
 - A menu bar (`F10`), mouse support, 40+ themes, and keys you can rebind.
 
@@ -52,6 +53,8 @@ Run it inside a git repository:
 ```bash
 zdiff                        # your changes against HEAD
 zdiff --watch                # refresh as you edit
+zdiff -c main                # main against your working tree
+zdiff -c main feature        # what feature changed since it split from main
 zdiff -f src 'tests/**/*.rs' # only these paths or globs
 zdiff --read-only            # no staging or committing
 zdiff --patch fix.patch      # view a patch file

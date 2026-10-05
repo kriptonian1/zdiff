@@ -206,6 +206,29 @@ impl Repo {
         }
     }
 
+    /// The commit `a` and `b` last shared, as a full hex id: where a branch split off.
+    ///
+    /// # Errors
+    /// Returns [`Error::Git`] for a name that isn't a commit, and [`Error::Refused`] when the
+    /// two share no history.
+    pub fn merge_base(&self, a: &str, b: &str) -> Result<String, Error> {
+        let a = self
+            .inner
+            .rev_parse_single(a)?
+            .object()?
+            .peel_to_commit()?
+            .id;
+        let b = self
+            .inner
+            .rev_parse_single(b)?
+            .object()?
+            .peel_to_commit()?
+            .id;
+        let base =
+            (self.inner.merge_base(a, b)).map_err(|_| Error::Refused("no shared history"))?;
+        Ok(base.to_string())
+    }
+
     /// Lists the files that differ between the two sides of `spec`, sorted by path.
     ///
     /// Only paths and statuses are computed; use [`Repo::diff`] for contents.

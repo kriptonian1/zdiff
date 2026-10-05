@@ -38,7 +38,7 @@ use ratatui::DefaultTerminal;
 use ratatui_image::picker::{Picker, ProtocolType};
 use zdiff_core::{Repo, Spec, StashOp};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use app::{App, Apply, Focus, Notice, Toast};
 use branches::GRAPH;
 use settings::Settings;
@@ -62,6 +62,9 @@ struct Args {
     /// directory.
     #[arg(short = 'f', long, value_name = "PATH", num_args = 1..)]
     focus: Vec<PathBuf>,
+    /// Compare against REV; with a second REV, what it changed since the two split.
+    #[arg(short, long, value_name = "REV", num_args = 1..=2, conflicts_with = "patch")]
+    compare: Vec<String>,
 }
 
 /// Everything the UI thread reacts to, from the input and watch threads.
@@ -84,6 +87,34 @@ pub enum Msg {
     Usage(usage::Usage),
 }
 
+/// The repository around the current directory, showing what `--compare` asks for.
+fn open_repo(args: &Args, cwd: &Path) -> anyhow::Result<Source> {
+    let repo = Repo::discover(cwd)?;
+    let spec = match args.compare.as_slice() {
+        [] => Spec::default(),
+        [base] => Spec::Worktree(base.clone()),
+        [base, head, ..] => {
+            let fork = repo.merge_base(base, head).context("--compare")?;
+            Spec::Revs(fork, head.clone())
+        }
+    };
+    let only = resolve(&args.focus, cwd, repo.workdir())?;
+    // ponytail: counts computed serially at startup; use a worker thread at 1000+ files.
+    let snapshot = Snapshot::load(&repo, &spec, None, &Touched::All, &only);
+    let snapshot = if args.compare.is_empty() {
+        snapshot?
+    } else {
+        snapshot.context("--compare")?
+    };
+    Ok(Source::Repo {
+        repo,
+        home: spec.clone(),
+        spec,
+        snapshot,
+        only,
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
@@ -92,17 +123,7 @@ fn main() -> anyhow::Result<()> {
         let only = Only::new(args.focus.iter().map(|p| clean(p)).collect());
         Source::patch(path, only.map_err(|e| anyhow!("--focus: {e}"))?)?
     } else {
-        let spec = Spec::default();
-        let repo = Repo::discover(".")?;
-        let only = resolve(&args.focus, &cwd, repo.workdir())?;
-        // ponytail: counts computed serially at startup; use a worker thread at 1000+ files.
-        let snapshot = Snapshot::load(&repo, &spec, None, &Touched::All, &only)?;
-        Source::Repo {
-            repo,
-            spec,
-            snapshot,
-            only,
-        }
+        open_repo(&args, &cwd)?
     };
     let mut app = App::new(source.entries());
     let name = |path: &Path| (path.file_name()).map(|name| name.to_string_lossy().into_owned());
@@ -110,7 +131,10 @@ fn main() -> anyhow::Result<()> {
         Source::Repo { repo, spec, .. } => {
             app.repo_name = name(repo.workdir()).unwrap_or_default();
             app.branch = repo.head_name();
-            app.compare = spec.to_string();
+            app.compare = match args.compare.as_slice() {
+                [base, head] => format!("{base}...{head}"),
+                _ => spec.to_string(),
+            };
         }
         Source::Patch { file, patch, .. } => {
             app.repo_name = file
@@ -128,7 +152,9 @@ fn main() -> anyhow::Result<()> {
     let (loaded, mut warnings) = config.as_deref().map(Settings::load).unwrap_or_default();
     warnings.extend(app.apply(loaded));
     // A patch is only viewed, never applied.
-    app.read_only = args.read_only || args.patch.is_some();
+    // Two revisions leave nothing to stage, and nothing to watch.
+    let two_revs = args.compare.len() == 2;
+    app.read_only = args.read_only || args.patch.is_some() || two_revs;
     app.patch_mode = args.patch.is_some();
     if !warnings.is_empty() {
         app.notice = Some(Notice::Error(format!("settings: {}", warnings.join("; "))));
@@ -152,8 +178,10 @@ fn main() -> anyhow::Result<()> {
         spec,
         snapshot,
         only,
+        ..
     } = &source
         && (args.watch || app.watch_default)
+        && !two_revs
     {
         let (spec, first) = (spec.clone(), snapshot.clone());
         watch::spawn(repo.workdir(), spec, first, only.clone(), tx.clone())?;
@@ -357,6 +385,7 @@ fn reload(app: &mut App, source: &mut Source, tx: &Sender<Msg>) -> bool {
             spec,
             snapshot,
             only,
+            ..
         } => {
             let Ok(next) = Snapshot::load(repo, spec, Some(snapshot), &Touched::All, only) else {
                 return false;
@@ -401,6 +430,7 @@ fn history_want(
         repo,
         spec,
         snapshot,
+        home,
         only,
     } = source
     else {
@@ -482,8 +512,8 @@ fn history_want(
             app.history_commits(stashes);
             false
         }),
-        history::Want::Back => load(&Spec::default()).map(|files| {
-            (*spec, *snapshot) = (Spec::default(), files);
+        history::Want::Back => load(home).map(|files| {
+            (*spec, *snapshot) = (home.clone(), files);
             app.refresh(snapshot.entries());
             app.viewing_closed();
             true
@@ -751,11 +781,69 @@ mod tests {
         let app = App::new(snapshot.entries());
         let source = Source::Repo {
             repo,
+            home: spec.clone(),
             spec,
             snapshot,
             only,
         };
         (dir, app, source)
+    }
+
+    #[test]
+    fn compare_two_branches_shows_only_what_the_branch_changed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("git runs");
+            assert!(ok.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["switch", "-q", "-c", "feature"]);
+        std::fs::write(dir.path().join("a.txt"), "2\n").unwrap();
+        git(&["commit", "-q", "-am", "feature"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "m\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "main"]);
+
+        let args = Args::try_parse_from(["zdiff", "-c", "main", "feature"]).expect("parses");
+        let source = open_repo(&args, dir.path()).expect("opens");
+        let entries = source.entries();
+        let paths: Vec<_> = entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(paths, [PathBuf::from("a.txt")], "not main's own commit");
+        let mut app = App::new(entries);
+        app.show(Some(source.diff(0)));
+        let screen = crate::ui::render(&mut app, 100, 20);
+        assert!(screen.iter().any(|row| row.contains('2')), "{screen:#?}");
+    }
+
+    #[test]
+    fn back_returns_to_the_compare_view_zdiff_started_with() {
+        let (_dir, mut app, mut source) = one_commit_repo();
+        let Source::Repo { repo, home, .. } = &mut source else {
+            unreachable!()
+        };
+        let commit = repo.log(1).expect("a log").remove(0);
+        *home = repo.commit_spec(&commit);
+        let start = home.clone();
+
+        assert!(history_want(
+            &mut app,
+            &mut source,
+            history::Want::Back,
+            &mut None
+        ));
+        let files = (app.tree.files()).map(|(_, f)| f.path.clone());
+        assert_eq!(files.collect::<Vec<_>>(), [PathBuf::from("old.txt")]);
+        assert!(matches!(&source, Source::Repo { spec, .. } if *spec == start));
     }
 
     #[test]

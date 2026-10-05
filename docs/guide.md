@@ -4,6 +4,7 @@ This guide covers every feature, the default keys, and the settings file. Read t
 
 - [What zdiff shows](#what-zdiff-shows)
 - [Command line](#command-line)
+- [Compare branches](#compare-branches)
 - [The screen](#the-screen)
 - [Moving around](#moving-around)
 - [Views and folds](#views-and-folds)
@@ -20,7 +21,7 @@ This guide covers every feature, the default keys, and the settings file. Read t
 
 ## What zdiff shows
 
-zdiff compares `HEAD` with the files on disk, like `git diff HEAD`. Staged and unstaged changes both show, and so do untracked files.
+By default zdiff compares `HEAD` with the files on disk, like `git diff HEAD`. Staged and unstaged changes both show, and so do untracked files. `--compare` picks other sides; see [Compare branches](#compare-branches).
 
 Run it anywhere inside a repository. Paths you give are relative to the current directory.
 
@@ -33,6 +34,7 @@ zdiff [OPTIONS]
       --read-only        No staging or committing, whatever the settings say
       --patch <FILE>     View a patch file instead of the repository; `-` reads stdin
   -f, --focus <PATH>...  Show only these files, folders, or globs
+  -c, --compare <REV>... Compare against REV; with a second REV, what it changed since the two split
   -h, --help
   -V, --version
 ```
@@ -43,6 +45,21 @@ Examples:
 zdiff -f src/app.rs src/ui     # one file and one folder
 zdiff -f 'crates/**/*.rs'      # quote globs so the shell leaves them alone
 ```
+
+## Compare branches
+
+`-c` (`--compare`) takes one or two revisions. A revision is a branch, a tag, a commit hash, or anything like `HEAD~3`.
+
+| Command | Shows | Like |
+|---|---|---|
+| `zdiff -c main` | `main` against your working tree | `git diff main` |
+| `zdiff -c main feature` | What `feature` changed since it split from `main` | `git diff main...feature`, a GitHub PR |
+
+With two revisions, both sides are commits, so staging, committing, and watching are off. The footer shows `main...feature`. With one revision, the working tree is the new side, so they stay on.
+
+History's Back returns to the comparison you started with.
+
+`--compare` can't be used with `--patch`. Two branches with no shared history are refused.
 
 ## The screen
 

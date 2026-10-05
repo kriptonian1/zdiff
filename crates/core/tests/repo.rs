@@ -215,6 +215,37 @@ fn between_two_revisions() {
 }
 
 #[test]
+fn merge_base_is_where_a_branch_split_off() {
+    let dir = init();
+    fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    let fork = commit(dir.path());
+    git(dir.path(), &["switch", "-q", "-c", "feature"]);
+    fs::write(dir.path().join("feature.txt"), "f\n").unwrap();
+    commit(dir.path());
+    git(dir.path(), &["switch", "-q", "-"]);
+    fs::write(dir.path().join("main.txt"), "m\n").unwrap();
+    commit(dir.path());
+
+    let repo = Repo::discover(dir.path()).unwrap();
+    let base = repo
+        .merge_base("HEAD", "feature")
+        .expect("they share a commit");
+    assert_eq!(base, fork);
+    assert_eq!(
+        list(&repo, &Spec::Revs(base, "feature".into())),
+        [("feature.txt".into(), Status::Added)],
+        "only the branch's own change, not main's"
+    );
+
+    git(dir.path(), &["switch", "-q", "--orphan", "lonely"]);
+    git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "x"]);
+    assert!(matches!(
+        repo.merge_base("lonely", "feature"),
+        Err(Error::Refused(_))
+    ));
+}
+
+#[test]
 fn open_repo_sees_later_index_changes() {
     let dir = init();
     fs::write(dir.path().join("f.txt"), "a\n").unwrap();
