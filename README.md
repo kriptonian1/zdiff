@@ -29,14 +29,24 @@ Written in Rust. It reads git in-process with [gitoxide](https://github.com/Gito
 
 ## Install
 
-### Homebrew (macOS and Linux)
+### One command (macOS and Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kriptonian1/zdiff/main/install.sh | sh
+```
+
+It installs with Homebrew when you have it, and when brew is missing or fails, it puts the release binary in `~/.local/bin`. macOS and most Linux systems ship an unrelated `/usr/bin/zdiff`, so the script also puts zdiff first in your PATH when it needs to.
+
+### Homebrew
 
 ```bash
 brew tap kriptonian1/zdiff https://github.com/kriptonian1/zdiff
-brew install zdiff
+brew install --cask kriptonian1/zdiff/zdiff
 ```
 
-macOS and most Linux systems ship an unrelated `/usr/bin/zdiff` that compares gzip files. If `zdiff` prints `usage: /usr/bin/zdiff [options] file1 [file2]`, put Homebrew first in your PATH:
+zdiff ships as a cask, so brew installs the prebuilt binary without checking for Xcode. If you installed the old zdiff formula, run `brew uninstall --formula zdiff` first.
+
+macOS and most Linux systems ship an unrelated `/usr/bin/zdiff` that compares gzip files. If `zdiff` prints `usage: /usr/bin/zdiff [options] file1 [file2]`, add this line to the end of `~/.zshrc` (or `~/.bashrc` for bash), then open a new terminal:
 
 ```bash
 export PATH="$(brew --prefix)/bin:$PATH"

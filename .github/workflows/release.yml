@@ -1,7 +1,7 @@
 name: Release
 
 # Releases when the version in Cargo.toml has no tag yet: builds the binaries,
-# publishes them as a GitHub release, and points Formula/zdiff.rb at them.
+# publishes them as a GitHub release, and points Casks/zdiff.rb at them.
 on:
   push:
     branches: [main]
@@ -75,25 +75,30 @@ jobs:
           path: dist
           merge-multiple: true
       - run: gh release create "v$VERSION" dist/*.tar.gz --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
-      - name: Update the formula
+      - name: Update the cask
         run: |
           python3 - <<'PY'
           import hashlib, os, pathlib, re
-          formula = pathlib.Path("Formula/zdiff.rb")
-          text = formula.read_text()
+          cask = pathlib.Path("Casks/zdiff.rb")
+          text = cask.read_text()
           text = re.sub(r'version "[^"]*"', f'version "{os.environ["VERSION"]}"', text, count=1)
-          for archive in pathlib.Path("dist").glob("*.tar.gz"):
-              sha = hashlib.sha256(archive.read_bytes()).hexdigest()
-              pattern = rf'({re.escape(archive.name)}"\n\s*sha256 ")[0-9a-f]*'
-              text, found = re.subn(pattern, rf"\g<1>{sha}", text)
-              assert found == 1, f"{archive.name} isn't in the formula"
-          formula.write_text(text)
+          keys = {
+              "aarch64-apple-darwin": "arm",
+              "x86_64-apple-darwin": "intel",
+              "aarch64-unknown-linux-gnu": "arm64_linux",
+              "x86_64-unknown-linux-gnu": "x86_64_linux",
+          }
+          for target, key in keys.items():
+              sha = hashlib.sha256(pathlib.Path(f"dist/zdiff-{target}.tar.gz").read_bytes()).hexdigest()
+              text, found = re.subn(rf'(\b{key}:\s*")[0-9a-f]{{64}}', rf"\g<1>{sha}", text)
+              assert found == 1, f"{key} isn't in the cask"
+          cask.write_text(text)
           PY
       # Pushes made with the workflow token don't start another run.
-      - name: Commit the formula
+      - name: Commit the cask
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: zdiff $VERSION in the brew formula"
+          git commit -am "chore: zdiff $VERSION in the brew cask"
           git pull --rebase origin main
           git push origin HEAD:main
